@@ -1,0 +1,989 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RAG demo</title>
+
+  <!--
+    Стили намеренно простые и в одном файле — чтобы было видно структуру.
+    Главный приём: грид с двумя колонками (вопрос/настройки слева, ответ справа).
+  -->
+  <style>
+    :root {
+      --bg: #0f1115;
+      --panel: #181b22;
+      --panel-2: #1f232c;
+      --border: #2a2f3a;
+      --text: #e6e8ec;
+      --muted: #9aa0aa;
+      --accent: #7aa2f7;
+      --green: #9ece6a;
+      --orange: #e0af68;
+      --mono: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, monospace;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { min-height: 100vh; padding: 24px; }
+
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 8px; }
+    .sub { color: var(--muted); margin: 0 0 20px; font-size: 14px; }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 380px 1fr;
+      gap: 20px;
+    }
+    @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px;
+    }
+    .panel + .panel { margin-top: 16px; }
+
+    label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+    textarea, input[type="number"] {
+      width: 100%;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px;
+      color: var(--text);
+      font: 14px var(--mono);
+    }
+    textarea { resize: vertical; min-height: 90px; }
+    .row { display: flex; gap: 12px; align-items: center; margin-top: 12px; }
+    .row > div { flex: 1; }
+    button {
+      background: var(--accent);
+      color: #0b0e14;
+      border: 0;
+      border-radius: 6px;
+      padding: 10px 16px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.secondary { background: transparent; color: var(--text); border: 1px solid var(--border); }
+
+    .checkbox { display: flex; align-items: center; gap: 8px; color: var(--text); font-size: 14px; }
+
+    .chunks { display: flex; flex-direction: column; gap: 10px; }
+    .chunk {
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 13px;
+    }
+    .chunk-head {
+      display: flex; justify-content: space-between; gap: 12px;
+      font-family: var(--mono); color: var(--muted); margin-bottom: 6px;
+    }
+    .chunk-head .src { color: var(--text); }
+    .score {
+      display: inline-block; padding: 1px 6px; border-radius: 4px;
+      background: rgba(122, 162, 247, 0.15); color: var(--accent);
+      font-family: var(--mono);
+    }
+    .chunk-body { color: var(--text); white-space: pre-wrap; line-height: 1.4; }
+
+    pre.prompt, pre.answer {
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      font: 13px/1.5 var(--mono);
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 380px;
+      overflow: auto;
+      margin: 0;
+    }
+    pre.answer { max-height: none; color: var(--text); }
+    .answer-pending { color: var(--muted); font-style: italic; }
+
+    .meta-bar {
+      display: flex; justify-content: space-between; align-items: center;
+      gap: 12px; margin-bottom: 8px; font-size: 13px; color: var(--muted);
+    }
+    .badge {
+      font-family: var(--mono);
+      padding: 2px 8px;
+      border-radius: 4px;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+    }
+    .badge.ok { color: var(--green); }
+    .badge.err { color: var(--orange); }
+
+    details { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; }
+    details + details { margin-top: 8px; }
+    summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+    details[open] summary { color: var(--text); margin-bottom: 8px; }
+
+    /* ============== Образовательные блоки ============== */
+    .stat-row { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 10px; font-size: 13px; }
+    .stat-row > div { color: var(--muted); }
+    .stat-row b { color: var(--text); font-family: var(--mono); font-weight: 600; }
+
+    /* Heatmap-полоска: 64 квадратика, цвет показывает знак и величину компоненты. */
+    .heatmap {
+      display: grid;
+      grid-template-columns: repeat(32, 1fr);
+      gap: 2px;
+      margin: 8px 0;
+    }
+    .heatmap .cell { aspect-ratio: 1; border-radius: 2px; min-width: 8px; }
+
+    .vec-preview {
+      font: 11px/1.5 var(--mono);
+      color: var(--muted);
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 10px;
+      max-height: 90px; overflow: auto;
+      word-break: break-all;
+    }
+
+    /* Пошаговый расчёт cosine */
+    .formula {
+      font: 14px/1.6 var(--mono);
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px 12px;
+      color: var(--text);
+      margin: 8px 0;
+    }
+    .formula .var { color: var(--accent); }
+    .formula .num { color: var(--green); }
+    .formula .comment { color: var(--muted); font-style: italic; }
+
+    /* Гистограмма similarity по всем чанкам */
+    .scores-list { display: flex; flex-direction: column; gap: 4px; }
+    .score-row {
+      display: grid;
+      grid-template-columns: minmax(160px, 1fr) 60px 1fr;
+      gap: 10px;
+      align-items: center;
+      font: 12px/1.4 var(--mono);
+    }
+    .score-row .src { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .score-row .val { color: var(--text); text-align: right; }
+    .score-row.top .val { color: var(--green); font-weight: 600; }
+    .score-bar {
+      height: 10px;
+      background: var(--panel-2);
+      border-radius: 3px;
+      position: relative;
+      overflow: hidden;
+    }
+    .score-bar .fill {
+      position: absolute; left: 0; top: 0; bottom: 0;
+      background: var(--accent);
+      border-radius: 3px;
+    }
+    .score-row.top .score-bar .fill { background: var(--green); }
+
+    /* Вертикальная пунктирная линия порога поверх score-bar */
+    .score-bar .threshold-line {
+      position: absolute; top: -2px; bottom: -2px;
+      width: 0; border-left: 2px dashed var(--orange);
+      pointer-events: none;
+    }
+
+    /* Жёлтая плашка-предупреждение над ответом */
+    .warn {
+      background: rgba(224, 175, 104, 0.12);
+      border: 1px solid var(--orange);
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-bottom: 10px;
+      color: var(--orange);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .warn b { font-family: var(--mono); color: var(--orange); }
+
+    /* Slider оформление */
+    input[type="range"] {
+      width: 100%;
+      accent-color: var(--accent);
+    }
+    .slider-row {
+      display: flex; align-items: center; justify-content: space-between;
+      font-size: 13px; color: var(--muted); margin-bottom: 4px;
+    }
+    .slider-row .val { color: var(--text); font-family: var(--mono); }
+
+    /* Radio-группа режимов поиска */
+    .mode-group {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 6px;
+      margin-top: 6px;
+    }
+    .mode-group label {
+      display: flex; align-items: center; justify-content: center;
+      gap: 4px;
+      padding: 6px 4px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--panel-2);
+      cursor: pointer;
+      font-size: 13px;
+      color: var(--muted);
+      transition: all 0.15s;
+      margin: 0;
+    }
+    .mode-group input[type="radio"] {
+      accent-color: var(--accent);
+    }
+    .mode-group label:has(input:checked) {
+      color: var(--text);
+      border-color: var(--accent);
+      background: rgba(122, 162, 247, 0.08);
+    }
+
+    /* Бейджи рангов внутри карточки чанка */
+    .chunk-badges {
+      display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px;
+    }
+    .badge-mini {
+      font-family: var(--mono);
+      font-size: 11px;
+      padding: 1px 6px;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--muted);
+    }
+    .badge-mini b { color: var(--text); font-weight: 600; }
+    .badge-mini.cos { border-color: rgba(122, 162, 247, 0.4); }
+    .badge-mini.cos b { color: var(--accent); }
+    .badge-mini.txt { border-color: rgba(158, 206, 106, 0.4); }
+    .badge-mini.txt b { color: var(--green); }
+    .badge-mini.rrf { border-color: rgba(224, 175, 104, 0.4); }
+    .badge-mini.rrf b { color: var(--orange); }
+    .badge-mini.muted { opacity: 0.4; }
+
+    /* Citation chip [N] внутри ответа LLM */
+    .citation {
+      display: inline-block;
+      font-family: var(--mono);
+      font-size: 0.85em;
+      font-weight: 600;
+      padding: 0 5px;
+      margin: 0 1px;
+      border-radius: 4px;
+      background: rgba(122, 162, 247, 0.18);
+      color: var(--accent);
+      border: 1px solid rgba(122, 162, 247, 0.4);
+      cursor: pointer;
+      vertical-align: baseline;
+      text-decoration: none;
+      user-select: none;
+      transition: all 0.1s;
+    }
+    .citation:hover {
+      background: rgba(122, 162, 247, 0.32);
+      border-color: var(--accent);
+    }
+    .citation.dead {
+      background: rgba(224, 175, 104, 0.12);
+      color: var(--orange);
+      border-color: rgba(224, 175, 104, 0.4);
+      cursor: help;
+    }
+
+    /* Подсветка чанка, на который указала citation */
+    .chunk.flash {
+      animation: flash 1.6s ease-out;
+    }
+    @keyframes flash {
+      0%   { box-shadow: 0 0 0 2px var(--accent), 0 0 16px rgba(122,162,247,0.4); }
+      60%  { box-shadow: 0 0 0 2px var(--accent), 0 0 8px rgba(122,162,247,0.2); }
+      100% { box-shadow: 0 0 0 0 transparent; }
+    }
+  </style>
+</head>
+<body>
+
+<h1>RAG demo — LM Studio + pgvector</h1>
+<p class="sub">Учебный интерфейс. Видно весь pipeline: найденные чанки → промпт → ответ LLM.</p>
+
+<div class="grid">
+  <!-- ЛЕВАЯ КОЛОНКА: ввод вопроса и настройки -->
+  <div>
+    <div class="panel">
+      <label for="q">Вопрос</label>
+      <textarea id="q" placeholder="Например: Что такое GIL? Объясни ACID. Как работает HNSW?"></textarea>
+
+      <div class="row">
+        <div>
+          <label for="k">top_k</label>
+          <input id="k" type="number" min="1" max="20" value="5">
+        </div>
+        <div>
+          <label>&nbsp;</label>
+          <div class="checkbox">
+            <input id="stream" type="checkbox" checked>
+            <label for="stream" style="margin:0">streaming</label>
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top: 12px;">
+        <label style="margin: 0 0 4px;">режим поиска</label>
+        <div class="mode-group">
+          <label><input type="radio" name="searchMode" value="vector"> vector</label>
+          <label><input type="radio" name="searchMode" value="text"> text</label>
+          <label><input type="radio" name="searchMode" value="hybrid" checked> hybrid</label>
+        </div>
+        <div class="sub" style="margin: 4px 0 0; font-size: 12px;">
+          hybrid = vector + text + RRF (обычно лучший recall).
+        </div>
+      </div>
+
+      <div style="margin-top: 12px;">
+        <div class="slider-row">
+          <label for="minSim" style="margin:0">min similarity</label>
+          <span class="val" id="minSimVal">0.50</span>
+        </div>
+        <input id="minSim" type="range" min="0" max="1" step="0.01" value="0.50">
+        <div class="sub" style="margin: 4px 0 0; font-size: 12px;">
+          если cosine top-1 ниже — над ответом появится предупреждение.
+        </div>
+      </div>
+
+      <div class="row">
+        <button id="askBtn">Спросить</button>
+        <button id="abortBtn" class="secondary" disabled>Прервать</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Статус</h2>
+      <div class="meta-bar">
+        <span>База: <span id="dbStatus" class="badge">…</span></span>
+        <span id="latency" class="badge"></span>
+      </div>
+      <div id="error" class="sub" style="color: var(--orange); display: none;"></div>
+    </div>
+  </div>
+
+  <!-- ПРАВАЯ КОЛОНКА: результаты -->
+  <div>
+    <!-- 1. ЭМБЕДДИНГ ЗАПРОСА — как текст превращается в вектор -->
+    <div class="panel">
+      <h2>1. Эмбеддинг запроса — текст → вектор</h2>
+      <div id="explainEmbed" class="sub">
+        Введи вопрос и нажми «Спросить». Здесь покажу сам вектор запроса —
+        первые несколько значений и тепловую карту.
+      </div>
+    </div>
+
+    <!-- 2. RETRIEVAL — что нашли -->
+    <div class="panel">
+      <h2>2. Retrieval — что нашли в базе (top-K)</h2>
+      <div class="sub" style="margin: 0 0 8px;">
+        Бейджи в карточке: <b style="color:var(--accent)">cos</b> — cosine similarity и ранг в vector-поиске,
+        <b style="color:var(--green)">bm25</b> — ts_rank_cd и ранг в text-поиске,
+        <b style="color:var(--orange)">rrf</b> — итоговый Reciprocal Rank Fusion score.
+      </div>
+      <div id="chunks" class="chunks">
+        <div class="sub">Здесь появятся найденные чанки и их similarity-score.</div>
+      </div>
+    </div>
+
+    <!-- 3. COSINE — как именно посчитан score -->
+    <div class="panel">
+      <h2>3. Cosine similarity — как считается</h2>
+      <div id="explainCosine" class="sub">
+        Здесь будет пошаговый расчёт cosine similarity между вектором запроса
+        и вектором самого релевантного чанка.
+      </div>
+    </div>
+
+    <!-- 4. ВСЕ СКОРЫ — ранжирование всей базы -->
+    <div class="panel">
+      <h2>4. Similarity по всем чанкам базы</h2>
+      <details id="scoresDetails">
+        <summary>Раскрыть распределение (видно разрыв между релевантными и нерелевантными)</summary>
+        <div id="scoresList" class="scores-list" style="margin-top: 10px;"></div>
+      </details>
+    </div>
+
+    <!-- 5. ПРОМПТ -->
+    <div class="panel">
+      <h2>5. Промпт — что улетело в LLM</h2>
+      <details id="promptDetails">
+        <summary>Показать итоговый user-промпт</summary>
+        <pre id="prompt" class="prompt"></pre>
+      </details>
+    </div>
+
+    <!-- 6. ОТВЕТ -->
+    <div class="panel">
+      <h2>6. Ответ LLM</h2>
+      <div id="warnBox"></div>
+      <pre id="answer" class="answer answer-pending">Жду вопроса…</pre>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ============================================================================
+   Простой vanilla-JS клиент. Без сборщиков, без npm — чтобы было максимально
+   прозрачно. Два режима: обычный fetch и SSE через EventSource.
+
+   ВАЖНО ПО БЕЗОПАСНОСТИ: весь пользовательский / серверный текст вставляем
+   через textContent (или присваивание .textContent у уже созданных элементов).
+   Никакого innerHTML с динамическими данными — это защита от XSS даже в
+   локальном приложении (мало ли что окажется в чанках).
+   ============================================================================ */
+
+const $ = (id) => document.getElementById(id);
+
+let activeAbort = null;     // AbortController для fetch
+let activeSource = null;    // EventSource для SSE
+
+// Слайдер порога — обновляем текущее значение рядом.
+$("minSim").addEventListener("input", (e) => {
+  $("minSimVal").textContent = Number(e.target.value).toFixed(2);
+});
+
+function setBusy(busy) {
+  $("askBtn").disabled = busy;
+  $("abortBtn").disabled = !busy;
+}
+
+function showError(msg) {
+  const el = $("error");
+  el.style.display = msg ? "" : "none";
+  el.textContent = msg || "";
+}
+
+// Маленький helper для создания элементов: createEl("div", {class: "x"}, "текст")
+function createEl(tag, attrs, ...children) {
+  const el = document.createElement(tag);
+  if (attrs) {
+    for (const [k, v] of Object.entries(attrs)) {
+      if (k === "class") el.className = v;
+      else if (k === "style") el.setAttribute("style", v);
+      else el.setAttribute(k, v);
+    }
+  }
+  for (const child of children) {
+    if (child == null) continue;
+    if (typeof child === "string") {
+      el.appendChild(document.createTextNode(child));
+    } else {
+      el.appendChild(child);
+    }
+  }
+  return el;
+}
+
+// Один мини-бейджик: cosine / bm25 rank / rrf. Если значения нет — серый «—».
+function badge(cls, label, valueText, present) {
+  const badgeEl = createEl(
+    "span",
+    { class: "badge-mini " + cls + (present ? "" : " muted") },
+    `${label}: `,
+    createEl("b", null, valueText)
+  );
+  return badgeEl;
+}
+
+function renderChunks(chunks, mode = "hybrid") {
+  const root = $("chunks");
+  root.replaceChildren();
+  if (!chunks.length) {
+    root.appendChild(
+      createEl("div", { class: "sub" },
+        "Ничего не нашлось. База пуста? Запусти `python ingest.py`.")
+    );
+    return;
+  }
+  chunks.forEach((c, i) => {
+    const full = c.content || "";
+    const preview = full.length > 400 ? full.slice(0, 400) + "…" : full;
+
+    // Заголовок: позиция в финальном top + источник + основной score
+    // (зависит от режима — для удобства глазами «что ранжировало»).
+    const headLeft = createEl("span", null,
+      `#${i + 1} · `,
+      createEl("span", { class: "src" }, `${c.source}#${c.chunk_index}`));
+
+    let primaryScore;
+    if (mode === "text") {
+      primaryScore = (c.text_score != null ? c.text_score : 0).toFixed(4);
+    } else if (mode === "hybrid") {
+      primaryScore = (c.rrf_score != null ? c.rrf_score : 0).toFixed(4);
+    } else {
+      primaryScore = Number(c.similarity).toFixed(4);
+    }
+    const headRight = createEl("span", { class: "score" }, primaryScore);
+    const head = createEl("div", { class: "chunk-head" }, headLeft, headRight);
+
+    const body = createEl("div", { class: "chunk-body" }, preview);
+
+    // Бейджи рангов — показываем всегда, чтобы было понятно «по чему попал».
+    const badges = createEl("div", { class: "chunk-badges" },
+      badge(
+        "cos",
+        "cos",
+        c.vector_rank != null
+          ? `${c.similarity.toFixed(3)} (#${c.vector_rank})`
+          : c.similarity.toFixed(3),
+        c.vector_rank != null
+      ),
+      badge(
+        "txt",
+        "bm25",
+        c.text_rank != null
+          ? `${c.text_score.toFixed(3)} (#${c.text_rank})`
+          : "—",
+        c.text_rank != null
+      ),
+      badge(
+        "rrf",
+        "rrf",
+        c.rrf_score != null ? c.rrf_score.toFixed(4) : "—",
+        c.rrf_score != null
+      ),
+    );
+
+    const card = createEl("div", { class: "chunk" }, head, body, badges);
+    // Стабильный id для скролла из citation в ответе LLM.
+    // Нумерация совпадает с тем что LLM получает в промпте ([Фрагмент N]).
+    card.id = "chunk-" + (i + 1);
+    root.appendChild(card);
+  });
+}
+
+/*
+ * Подсветить и проскроллить к чанку, на который ссылается citation [N].
+ * Делаем мягкий scroll + короткую анимацию рамки, чтобы было видно куда
+ * ушёл взгляд пользователя.
+ */
+function flashChunk(n) {
+  const el = $("chunk-" + n);
+  if (!el) return false;
+  el.scrollIntoView({ behavior: "smooth", block: "center" });
+  // Перезапускаем анимацию: убираем класс, форсим reflow, ставим обратно.
+  el.classList.remove("flash");
+  void el.offsetWidth;  // force reflow
+  el.classList.add("flash");
+  return true;
+}
+
+/*
+ * Превращает plain-текст ответа в DOM с кликабельными citations.
+ * Парсит подряд идущие группы [1][2][3] как несколько отдельных ссылок.
+ * Если citation указывает на номер вне top-K — рендерим как «мёртвую»
+ * (оранжевую) подсказку: LLM сослалась на то чего нет.
+ */
+function renderAnswerWithCitations(answerText, chunksCount) {
+  const target = $("answer");
+  target.replaceChildren();
+  if (!answerText) {
+    target.textContent = "";
+    return;
+  }
+
+  // Регулярка ищет последовательности вида [12] (только число внутри).
+  // Используем split с группой захвата — получим массив, где на чётных
+  // индексах текст, на нечётных — содержимое скобок.
+  const parts = answerText.split(/\[(\d+)\]/g);
+
+  for (let i = 0; i < parts.length; i++) {
+    const piece = parts[i];
+    if (i % 2 === 0) {
+      // обычный текст
+      if (piece) target.appendChild(document.createTextNode(piece));
+    } else {
+      // [N] — кликабельная citation
+      const n = parseInt(piece, 10);
+      const alive = n >= 1 && n <= chunksCount;
+      const a = createEl(
+        "a",
+        {
+          class: "citation" + (alive ? "" : " dead"),
+          title: alive
+            ? "Перейти к фрагменту #" + n
+            : "LLM сослалась на #" + n + ", но в top-K такого фрагмента нет",
+        },
+        "[" + n + "]"
+      );
+      if (alive) {
+        a.addEventListener("click", (ev) => {
+          ev.preventDefault();
+          flashChunk(n);
+        });
+      }
+      target.appendChild(a);
+    }
+  }
+}
+
+/* =============================================================
+   Образовательный режим: визуализация эмбеддинга и cosine similarity.
+   ============================================================= */
+
+// Цвет ячейки heatmap по знаку и абсолютной величине компоненты.
+// Положительные → синий, отрицательные → оранжевый, интенсивность по |x|.
+// Эмбеддинги обычно лежат в небольшом диапазоне (~[-0.1, +0.1]) — нормируем
+// под него, иначе тепловая карта окажется почти серой.
+function heatColor(v, scale = 0.07) {
+  const norm = Math.max(-1, Math.min(1, v / scale));
+  const a = Math.abs(norm);
+  if (norm >= 0) {
+    // accent (122, 162, 247) → синий
+    return `rgba(122, 162, 247, ${0.15 + 0.75 * a})`;
+  } else {
+    // orange (224, 175, 104) → оранжевый
+    return `rgba(224, 175, 104, ${0.15 + 0.75 * a})`;
+  }
+}
+
+function makeHeatmap(values) {
+  const grid = createEl("div", { class: "heatmap" });
+  values.forEach((v) => {
+    const cell = createEl("div", { class: "cell", title: v.toFixed(5) });
+    cell.style.background = heatColor(v);
+    grid.appendChild(cell);
+  });
+  return grid;
+}
+
+// Краткое отображение части вектора в виде "[0.0234, -0.0561, …]".
+function formatVecPreview(values, decimals = 4) {
+  return "[" + values.map((v) => v.toFixed(decimals)).join(", ") + ", …]";
+}
+
+function renderEmbedExplain(ex) {
+  const root = $("explainEmbed");
+  root.replaceChildren();
+
+  // Строка статистики: модель, размерность, норма, время.
+  const stats = createEl("div", { class: "stat-row" },
+    createEl("div", null, "model: ", createEl("b", null, ex.embed_model)),
+    createEl("div", null, "dim: ", createEl("b", null, String(ex.embed_dim))),
+    createEl("div", null, "‖q‖ = ", createEl("b", null, ex.query_norm.toFixed(4))),
+    createEl("div", null, createEl("b", null, ex.embed_ms + " мс"))
+  );
+  root.appendChild(stats);
+
+  // Тепловая карта первых N компонент.
+  root.appendChild(createEl("div", { class: "sub", style: "margin: 6px 0 2px" },
+    `Heatmap первых ${ex.query_preview.length} компонент (синий = положит., оранжевый = отриц.):`));
+  root.appendChild(makeHeatmap(ex.query_preview));
+
+  // Превью в виде чисел — чтобы можно было скопировать и посмотреть точные значения.
+  root.appendChild(createEl("div", { class: "sub", style: "margin: 8px 0 2px" },
+    "Значения первых компонент вектора:"));
+  root.appendChild(createEl("div", { class: "vec-preview" },
+    formatVecPreview(ex.query_preview)));
+
+  // Пояснение про норму. У bge-m3 векторы нормализованы → ‖q‖ ≈ 1.
+  const normHint = Math.abs(ex.query_norm - 1.0) < 0.01
+    ? "Норма ≈ 1 → bge-m3 возвращает уже нормализованные векторы. Для нормализованных векторов cosine similarity ≡ скалярному произведению."
+    : "Норма заметно отличается от 1 — векторы не нормализованы, делим на произведение норм при подсчёте cosine.";
+  root.appendChild(createEl("div", { class: "sub", style: "margin-top: 8px" }, normHint));
+}
+
+function renderCosineExplain(ex) {
+  const root = $("explainCosine");
+  root.replaceChildren();
+
+  if (ex.top_chunk_preview == null) {
+    root.appendChild(createEl("div", { class: "sub" },
+      "Не удалось получить top-1 чанк (база пуста?)."));
+    return;
+  }
+
+  // Текстовое пояснение формулы.
+  root.appendChild(createEl("div", { class: "sub" },
+    "Сходство двух векторов q (запрос) и d (чанк) через cosine similarity:"));
+
+  // Формула. Без MathJax — просто моноширинно, читается без зависимостей.
+  const formula = createEl("div", { class: "formula" });
+  const lines = [
+    "                q · d",
+    "  sim(q, d) = ─────────",
+    "              ‖q‖ · ‖d‖",
+  ];
+  lines.forEach((l) => {
+    formula.appendChild(createEl("div", null, l));
+  });
+  root.appendChild(formula);
+
+  // Подставленные числа для top-1.
+  const calc = createEl("div", { class: "formula" });
+  calc.appendChild(createEl("div", { class: "comment" },
+    "// расчёт руками для top-1 чанка:"));
+  const dot = ex.top_dot.toFixed(6);
+  const qn = ex.query_norm.toFixed(6);
+  const dn = ex.top_chunk_norm.toFixed(6);
+  const sim = ex.top_similarity.toFixed(6);
+  calc.appendChild(createEl("div", null, `  q · d   = ${dot}`));
+  calc.appendChild(createEl("div", null, `  ‖q‖     = ${qn}`));
+  calc.appendChild(createEl("div", null, `  ‖d‖     = ${dn}`));
+  calc.appendChild(createEl("div", null, `  ──────────────────────`));
+  calc.appendChild(createEl("div", null, `  sim     = ${dot} / (${qn} × ${dn})`));
+  calc.appendChild(createEl("div", null, `          = ${sim}`));
+  calc.appendChild(createEl("div", { class: "comment", style: "margin-top: 6px" },
+    "// Postgres через оператор `1 - (embedding <=> query::vector)` вернул то же число."));
+  root.appendChild(calc);
+
+  // Heatmap вектора чанка — чтобы наглядно сравнить с вектором запроса.
+  root.appendChild(createEl("div", { class: "sub", style: "margin: 10px 0 2px" },
+    "Heatmap первых компонент вектора top-1 чанка — сравни с heatmap запроса выше:"));
+  root.appendChild(makeHeatmap(ex.top_chunk_preview));
+}
+
+function renderAllScores(all_scores, topChunks, threshold = 0) {
+  const root = $("scoresList");
+  root.replaceChildren();
+  if (!all_scores.length) return;
+
+  // Подсветим топ-K через сверку по significance (similarity до 6 знаков).
+  const topVals = new Set(topChunks.map((c) => Number(c.similarity).toFixed(6)));
+
+  // Шкалу делаем фиксированной [0, 1]: тогда линия порога стоит на постоянной
+  // позиции, и можно глазами сравнивать запросы между собой.
+  all_scores.forEach((s) => {
+    const isTop = topVals.has(s.similarity.toFixed(6));
+    const row = createEl("div", { class: "score-row" + (isTop ? " top" : "") });
+
+    row.appendChild(createEl("div", { class: "src" },
+      `${s.source}#${s.chunk_index}`));
+    row.appendChild(createEl("div", { class: "val" }, s.similarity.toFixed(4)));
+
+    const bar = createEl("div", { class: "score-bar" });
+    const fill = createEl("div", { class: "fill" });
+    const pct = Math.max(0, Math.min(100, s.similarity * 100));
+    fill.style.width = pct + "%";
+    bar.appendChild(fill);
+
+    // Вертикальная пунктирная линия порога — на каждом баре.
+    if (threshold > 0) {
+      const line = createEl("div", { class: "threshold-line" });
+      line.style.left = (threshold * 100) + "%";
+      bar.appendChild(line);
+    }
+    row.appendChild(bar);
+
+    root.appendChild(row);
+  });
+}
+
+function renderWarning(ex) {
+  const box = $("warnBox");
+  box.replaceChildren();
+  if (!ex.below_threshold) return;
+
+  const sim = ex.top_similarity != null
+    ? Number(ex.top_similarity).toFixed(4)
+    : "—";
+  const thr = Number(ex.min_similarity).toFixed(2);
+
+  const msg = createEl("div", { class: "warn" },
+    createEl("div", null,
+      "⚠ Слабый контекст: top-1 similarity = ",
+      createEl("b", null, sim),
+      " < порог ",
+      createEl("b", null, thr),
+      ". "
+    ),
+    createEl("div", { style: "margin-top: 4px;" },
+      "LLM всё равно сгенерирует ответ — но скорее всего из контекста релевантной информации нет. ",
+      "Проверь чанки выше и не доверяй ответу без верификации."
+    )
+  );
+  box.appendChild(msg);
+}
+
+// Очистка образовательных блоков перед новым запросом.
+function resetExplain() {
+  $("explainEmbed").replaceChildren(
+    createEl("div", { class: "sub" }, "Считаю эмбеддинг запроса…")
+  );
+  $("explainCosine").replaceChildren(
+    createEl("div", { class: "sub" }, "Ждём результаты поиска…")
+  );
+  $("scoresList").replaceChildren();
+  $("warnBox").replaceChildren();
+}
+
+// --- Проверка здоровья сервера: показываем сколько чанков в БД ---
+async function pingHealth() {
+  try {
+    const r = await fetch("/api/health");
+    const j = await r.json();
+    const el = $("dbStatus");
+    el.className = "badge ok";
+    el.textContent = `${j.chunks_in_db} чанков`;
+  } catch {
+    const el = $("dbStatus");
+    el.className = "badge err";
+    el.textContent = "недоступна";
+  }
+}
+pingHealth();
+
+// --- Обычный (нестриминговый) запрос ---
+async function askNormal(query, topK, minSim, mode) {
+  const t0 = performance.now();
+  activeAbort = new AbortController();
+  const resp = await fetch("/api/ask", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      query, top_k: topK, min_similarity: minSim, search_mode: mode,
+    }),
+    signal: activeAbort.signal,
+  });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`HTTP ${resp.status}: ${text}`);
+  }
+  const data = await resp.json();
+  const respMode = data.explain ? data.explain.search_mode : mode;
+  renderChunks(data.chunks, respMode);
+  if (data.explain) {
+    renderEmbedExplain(data.explain);
+    renderCosineExplain(data.explain);
+    renderAllScores(data.explain.all_scores, data.chunks, data.explain.min_similarity);
+    renderWarning(data.explain);
+  }
+  $("prompt").textContent = data.prompt;
+  const ans = $("answer");
+  ans.classList.remove("answer-pending");
+  // В non-stream сразу есть полный ответ — парсим [N] и рендерим кликабельно.
+  renderAnswerWithCitations(data.answer, data.chunks.length);
+  $("latency").textContent = `${Math.round(performance.now() - t0)} мс`;
+}
+
+// --- Streaming-запрос через SSE ---
+function askStream(query, topK, minSim, mode) {
+  return new Promise((resolve, reject) => {
+    const t0 = performance.now();
+    // EventSource поддерживает только GET — поэтому параметры через query string.
+    const url = `/api/ask/stream?query=${encodeURIComponent(query)}`
+              + `&top_k=${topK}&min_similarity=${minSim}&search_mode=${mode}`;
+    const es = new EventSource(url);
+    activeSource = es;
+
+    let answer = "";
+    let chunksCount = 0;  // сохраним из meta, понадобится в done для citations
+    const ans = $("answer");
+    ans.textContent = "";
+    ans.classList.remove("answer-pending");
+
+    // Событие "meta" — приходит один раз в начале: чанки, промпт, explain.
+    es.addEventListener("meta", (e) => {
+      const payload = JSON.parse(e.data);
+      chunksCount = payload.chunks.length;
+      const m = payload.explain ? payload.explain.search_mode : "hybrid";
+      renderChunks(payload.chunks, m);
+      if (payload.explain) {
+        renderEmbedExplain(payload.explain);
+        renderCosineExplain(payload.explain);
+        renderAllScores(payload.explain.all_scores, payload.chunks, payload.explain.min_similarity);
+        renderWarning(payload.explain);
+      }
+      $("prompt").textContent = payload.prompt;
+    });
+
+    // Событие "token" — приходит много раз: очередной кусок текста ответа.
+    // Во время стрима показываем как plain text — без citations, чтобы
+    // не перепарсивать DOM на каждый токен.
+    es.addEventListener("token", (e) => {
+      const payload = JSON.parse(e.data);
+      answer += payload.text;
+      ans.textContent = answer;
+    });
+
+    // Событие "done" — поток закончился. Теперь весь ответ есть целиком —
+    // можно безопасно прогнать через парсер citations и перерисовать с
+    // кликабельными [N].
+    es.addEventListener("done", () => {
+      renderAnswerWithCitations(answer, chunksCount);
+      es.close();
+      activeSource = null;
+      $("latency").textContent = `${Math.round(performance.now() - t0)} мс`;
+      resolve();
+    });
+
+    es.onerror = () => {
+      if (es.readyState === EventSource.CLOSED) {
+        resolve();
+      } else {
+        es.close();
+        reject(new Error("Сеть/сервер: ошибка SSE"));
+      }
+    };
+  });
+}
+
+// --- Обработчик кнопки «Спросить» ---
+$("askBtn").addEventListener("click", async () => {
+  const query = $("q").value.trim();
+  const topK = parseInt($("k").value, 10) || 5;
+  const minSim = parseFloat($("minSim").value) || 0;
+  const useStream = $("stream").checked;
+  const mode = (document.querySelector('input[name="searchMode"]:checked') || {}).value || "hybrid";
+  if (!query) {
+    showError("Введи вопрос.");
+    return;
+  }
+  showError("");
+  setBusy(true);
+  const ans = $("answer");
+  ans.textContent = "Ищу контекст…";
+  ans.classList.add("answer-pending");
+  $("prompt").textContent = "";
+  $("promptDetails").open = false;
+  resetExplain();
+
+  try {
+    if (useStream) {
+      await askStream(query, topK, minSim, mode);
+    } else {
+      await askNormal(query, topK, minSim, mode);
+    }
+    pingHealth();
+  } catch (e) {
+    showError(e.message || String(e));
+    ans.textContent = "Ошибка.";
+  } finally {
+    setBusy(false);
+    activeAbort = null;
+  }
+});
+
+// --- Обработчик кнопки «Прервать» ---
+$("abortBtn").addEventListener("click", () => {
+  if (activeAbort) activeAbort.abort();
+  if (activeSource) { activeSource.close(); activeSource = null; }
+  setBusy(false);
+  $("answer").textContent = "Прервано.";
+});
+
+// Удобный шорткат: Ctrl/Cmd + Enter — отправить.
+$("q").addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") $("askBtn").click();
+});
+</script>
+
+</body>
+</html>

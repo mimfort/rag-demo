@@ -1,0 +1,37 @@
+# Поднимаем PostgreSQL с уже установленным расширением pgvector.
+# Образ pgvector/pgvector — это обычный postgres плюс скомпилированное расширение,
+# поэтому ничего отдельно собирать не нужно: пришёл, поднял, работает.
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: rag_postgres
+    restart: unless-stopped
+    environment:
+      # Эти переменные читает официальный образ postgres при первом запуске:
+      # он создаст пользователя, пароль и БД с такими именами.
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: rag
+      POSTGRES_DB: rag
+    ports:
+      # Пробрасываем порт 5433 на хосте → 5432 в контейнере.
+      # 5433 (а не 5432) чтобы не конфликтовать с системным Postgres,
+      # если он уже занимает 5432. При подключении psql-ом с хоста:
+      #   psql -h localhost -p 5433 -U rag -d rag
+      - "5433:5432"
+    volumes:
+      # Том для постоянного хранения данных — при docker compose down -v
+      # этот том можно удалить и начать с чистой БД.
+      - rag_pgdata:/var/lib/postgresql/data
+      # Скрипты из /docker-entrypoint-initdb.d/ выполняются только при ПЕРВОМ
+      # старте контейнера (когда тома ещё нет). Здесь мы создаём расширение
+      # vector и таблицу chunks.
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      # Простая проверка живости: pg_isready возвращает 0 если БД готова.
+      test: ["CMD-SHELL", "pg_isready -U rag -d rag"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  rag_pgdata:
