@@ -63,6 +63,24 @@ def _build_or_query(query: str) -> str | None:
 RRF_K = 60
 
 
+def _chat_id_where(chat_id: str | None) -> tuple[str, tuple]:
+    """
+    Возвращает SQL WHERE-фрагмент для фильтрации чанков по chat_id.
+
+    Семантика:
+      - chat_id is None  → "WHERE chat_id IS NULL"
+                            (только общая база, без приватных чанков)
+      - chat_id = "..."  → "WHERE chat_id IS NULL OR chat_id = %s"
+                            (общая база + приватные чанки этого чата)
+
+    Возвращает (where_clause, params_tuple) — params в порядке, в котором
+    их надо подставлять в выражение.
+    """
+    if chat_id is None:
+        return "WHERE chat_id IS NULL", ()
+    return "WHERE chat_id IS NULL OR chat_id = %s", (chat_id,)
+
+
 @dataclass(frozen=True)
 class RetrievedChunk:
     """Результат поиска: чанк + его «похожесть» на запрос."""
@@ -129,6 +147,8 @@ class ChunkInput:
     chunk_index: int
     content: str
     embedding: list[float]
+    # NULL = общая база. Заполнено — приватный чанк конкретного чата.
+    chat_id: str | None = None
 
 
 class VectorStore:
@@ -216,17 +236,137 @@ class VectorStore:
                 "ON chunks USING GIN (tsv)"
             )
 
+            # 4. Колонка chat_id — для будущего conversation mode.
+            #    NULL = чанк в «общей» базе (виден всем чатам).
+            #    Заполненное значение = чанк приватный для конкретного чата.
+            #    Retrieve позже будет фильтровать: WHERE chat_id IS NULL
+            #    OR chat_id = $cur_chat. Сейчас просто заводим колонку,
+            #    логику фильтрации добавим в следующей итерации.
+            cur.execute(
+                "ALTER TABLE chunks ADD COLUMN IF NOT EXISTS chat_id text"
+            )
+            # Индекс для быстрого «найди всё что относится к этому чату»
+            # и для DELETE при очистке/TTL.
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS chunks_chat_id_idx "
+                "ON chunks (chat_id)"
+            )
+
+            # 5. Колонка created_at — нужна для TTL-чистки чанков чатов.
+            #    DEFAULT now() ставится только для новых строк; на старых
+            #    значениях останется NULL — но это допустимо.
+            cur.execute(
+                "ALTER TABLE chunks ADD COLUMN IF NOT EXISTS "
+                "created_at timestamptz DEFAULT now()"
+            )
+
+            # 6. Таблицы для conversation mode.
+            #    chats — сами «беседы», у каждой свой uuid и title.
+            #    messages — сообщения user/assistant с привязкой к chat_id.
+            #    Удаление чата каскадно удаляет его сообщения (FK + ON DELETE).
+            #    chunks.chat_id ссылается на chats.id логически — но без FK,
+            #    чтобы можно было удалить чат, не «сиротя» чанки (их удаляем
+            #    отдельно, см. cleanup-логику в server.py).
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS chats (
+                    id          text PRIMARY KEY,
+                    title       text NOT NULL,
+                    created_at  timestamptz DEFAULT now(),
+                    expires_at  timestamptz  -- NULL = вечно, иначе TTL-метка
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS messages (
+                    id          serial PRIMARY KEY,
+                    chat_id     text NOT NULL
+                                  REFERENCES chats(id) ON DELETE CASCADE,
+                    role        text NOT NULL,   -- 'user' | 'assistant'
+                    content     text NOT NULL,
+                    created_at  timestamptz DEFAULT now()
+                )
+            """)
+            # Колонки для сохранения retrieval-pipeline шагов:
+            # assistant-message содержит структуру chunks/explain/prompt
+            # чтобы можно было перерендерить «как я дошёл до ответа» после
+            # перезагрузки страницы.
+            cur.execute(
+                "ALTER TABLE messages "
+                "ADD COLUMN IF NOT EXISTS chunks jsonb"
+            )
+            cur.execute(
+                "ALTER TABLE messages "
+                "ADD COLUMN IF NOT EXISTS explain jsonb"
+            )
+            cur.execute(
+                "ALTER TABLE messages "
+                "ADD COLUMN IF NOT EXISTS prompt text"
+            )
+            # Индекс на (chat_id, created_at) — для быстрой выборки
+            # «последние N сообщений данного чата».
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS messages_chat_idx "
+                "ON messages (chat_id, created_at)"
+            )
+
+            # 7. Уникальность чанка по (source, chunk_index, chat_id).
+            #    Раньше был UNIQUE (source, chunk_index), но он не учитывал
+            #    что один и тот же source может быть и в общей базе, и в
+            #    приватном чате. Postgres 15+ поддерживает NULLS NOT DISTINCT,
+            #    благодаря которому NULL=NULL и UNIQUE работает корректно
+            #    для общей базы тоже.
+            cur.execute("""
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname = 'chunks_source_chunk_index_key'
+                    ) THEN
+                        ALTER TABLE chunks
+                          DROP CONSTRAINT chunks_source_chunk_index_key;
+                    END IF;
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname = 'chunks_source_chunk_chat_uniq'
+                    ) THEN
+                        ALTER TABLE chunks
+                          ADD CONSTRAINT chunks_source_chunk_chat_uniq
+                          UNIQUE NULLS NOT DISTINCT
+                          (source, chunk_index, chat_id);
+                    END IF;
+                END$$;
+            """)
+
     # --- запись ---
 
-    def delete_source(self, source: str) -> int:
+    def delete_source(
+        self, source: str, chat_id: str | None | object = ...,
+    ) -> int:
         """
-        Удаляет все чанки конкретного файла.
-        Используется при переиндексации: проще удалить и вставить заново,
-        чем пытаться определить, какие чанки изменились.
-        Возвращает количество удалённых строк.
+        Удаляет чанки конкретного файла.
+
+        chat_id:
+          - не передан (sentinel ...) → удаляет ВСЕ записи этого source,
+                                         независимо от chat_id (старое
+                                         поведение, например для CLI ingest).
+          - None                       → только общую базу (chat_id IS NULL)
+          - конкретное значение        → только этот чат
+
+        Это нужно чтобы при загрузке файла в чат не задеть одноимённый
+        файл в общей базе или в другом чате.
         """
         with self._conn.cursor() as cur:
-            cur.execute("DELETE FROM chunks WHERE source = %s", (source,))
+            if chat_id is ...:
+                cur.execute("DELETE FROM chunks WHERE source = %s", (source,))
+            elif chat_id is None:
+                cur.execute(
+                    "DELETE FROM chunks WHERE source = %s AND chat_id IS NULL",
+                    (source,),
+                )
+            else:
+                cur.execute(
+                    "DELETE FROM chunks WHERE source = %s AND chat_id = %s",
+                    (source, chat_id),
+                )
             return cur.rowcount
 
     def insert_chunks(self, chunks: list[ChunkInput]) -> None:
@@ -243,14 +383,14 @@ class VectorStore:
             return
 
         sql = """
-            INSERT INTO chunks (source, chunk_index, content, embedding)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (source, chunk_index) DO UPDATE
+            INSERT INTO chunks (source, chunk_index, content, embedding, chat_id)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT ON CONSTRAINT chunks_source_chunk_chat_uniq DO UPDATE
             SET content = EXCLUDED.content,
                 embedding = EXCLUDED.embedding
         """
         rows = [
-            (c.source, c.chunk_index, c.content, c.embedding)
+            (c.source, c.chunk_index, c.content, c.embedding, c.chat_id)
             for c in chunks
         ]
         with self._conn.cursor() as cur:
@@ -263,6 +403,49 @@ class VectorStore:
             row = cur.fetchone()
             return int(row[0]) if row else 0
 
+    def list_sources(
+        self, chat_id: str | None = None
+    ) -> list[dict]:
+        """
+        Возвращает список загруженных источников с агрегатами.
+
+        Если chat_id передан — показывает только чанки этого чата.
+        Если None — общую базу (chat_id IS NULL).
+
+        Каждая запись:
+          {source, chunks: int, created_at: str | None, chat_id: str | None}
+        """
+        if chat_id is None:
+            where = "chat_id IS NULL"
+            params: tuple = ()
+        else:
+            where = "chat_id = %s"
+            params = (chat_id,)
+
+        sql = f"""
+            SELECT
+                source,
+                COUNT(*) AS chunks,
+                MAX(created_at) AS created_at,
+                chat_id
+            FROM chunks
+            WHERE {where}
+            GROUP BY source, chat_id
+            ORDER BY MAX(created_at) DESC NULLS LAST, source
+        """
+        with self._conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        return [
+            {
+                "source": row[0],
+                "chunks": int(row[1]),
+                "created_at": row[2].isoformat() if row[2] is not None else None,
+                "chat_id": row[3],
+            }
+            for row in rows
+        ]
+
     # --- чтение ---
 
     def search(
@@ -270,6 +453,7 @@ class VectorStore:
         query_embedding: list[float],
         top_k: int = 5,
         include_embeddings: bool = False,
+        chat_id: str | None = None,
     ) -> list[RetrievedChunk]:
         """
         Возвращает top_k наиболее похожих чанков на query_embedding.
@@ -290,6 +474,9 @@ class VectorStore:
         """
         # Колонку embedding выбираем только если попросили — экономим трафик.
         embed_select = ", embedding" if include_embeddings else ""
+        # Фильтр по chat_id: NULL = общая база (всегда видна); если передан
+        # chat_id — также включаем приватные чанки этого чата.
+        where_clause, where_params = _chat_id_where(chat_id)
         sql = f"""
             SELECT
                 source,
@@ -298,11 +485,15 @@ class VectorStore:
                 1 - (embedding <=> %s::vector) AS similarity
                 {embed_select}
             FROM chunks
+            {where_clause}
             ORDER BY embedding <=> %s::vector
             LIMIT %s
         """
+        # Параметры в порядке: 1) вектор для SELECT distance, 2) chat_id
+        # для WHERE если есть, 3) вектор для ORDER BY, 4) top_k.
+        params = (query_embedding,) + where_params + (query_embedding, top_k)
         with self._conn.cursor() as cur:
-            cur.execute(sql, (query_embedding, query_embedding, top_k))
+            cur.execute(sql, params)
             rows = cur.fetchall()
 
         result: list[RetrievedChunk] = []
@@ -328,7 +519,12 @@ class VectorStore:
     # ----------------------------------------------------------------
     # Полнотекстовый поиск
     # ----------------------------------------------------------------
-    def text_search(self, query: str, top_n: int = 20) -> list[TextHit]:
+    def text_search(
+        self,
+        query: str,
+        top_n: int = 20,
+        chat_id: str | None = None,
+    ) -> list[TextHit]:
         """
         Полнотекстовый поиск по колонке tsv.
 
@@ -356,7 +552,13 @@ class VectorStore:
         if or_query is None:
             return []
 
-        sql = """
+        # WHERE здесь должен быть встроен в основной запрос. У нас уже
+        # есть `WHERE tsv @@ q.query` — добавим AND для chat_id фильтра.
+        chat_clause, chat_params = _chat_id_where(chat_id)
+        # _chat_id_where возвращает с "WHERE ..." — переделаем в "AND ...".
+        chat_and = chat_clause.replace("WHERE", "AND", 1) if chat_clause else ""
+
+        sql = f"""
             WITH q AS (
                 SELECT
                     websearch_to_tsquery('russian', %s) ||
@@ -369,11 +571,13 @@ class VectorStore:
                 ts_rank_cd(tsv, q.query) AS rank
             FROM chunks, q
             WHERE tsv @@ q.query
+            {chat_and}
             ORDER BY rank DESC
             LIMIT %s
         """
+        params = (or_query, or_query) + chat_params + (top_n,)
         with self._conn.cursor() as cur:
-            cur.execute(sql, (or_query, or_query, top_n))
+            cur.execute(sql, params)
             rows = cur.fetchall()
         return [
             TextHit(
@@ -394,6 +598,7 @@ class VectorStore:
         query_embedding: list[float],
         top_k: int = 5,
         candidate_n: int = 20,
+        chat_id: str | None = None,
     ) -> list[RetrievedChunk]:
         """
         Hybrid search через Reciprocal Rank Fusion.
@@ -415,9 +620,10 @@ class VectorStore:
         candidate_n больше top_k намеренно: чем шире «воронка», тем больше
         шанс что слабый-в-обоих-но-стабильный кандидат поднимется в финал.
         """
-        # 1. Два поиска параллельно делать не будем — на 21 чанке смысла нет.
-        vec_hits = self.search(query_embedding, top_k=candidate_n)
-        txt_hits = self.text_search(query, top_n=candidate_n)
+        # 1. Два поиска параллельно делать не будем — на маленькой базе смысла нет.
+        # Прокидываем chat_id в оба, чтобы оба слоя видели одинаковую «видимость».
+        vec_hits = self.search(query_embedding, top_k=candidate_n, chat_id=chat_id)
+        txt_hits = self.text_search(query, top_n=candidate_n, chat_id=chat_id)
 
         # 2. Складываем всё в словарь по ключу (source, chunk_index).
         #    В нём же копим RRF-score и метаданные обоих рейтингов.
@@ -556,7 +762,11 @@ class VectorStore:
             return None
         return list(row[0])
 
-    def score_all(self, query_embedding: list[float]) -> list[ScoredChunk]:
+    def score_all(
+        self,
+        query_embedding: list[float],
+        chat_id: str | None = None,
+    ) -> list[ScoredChunk]:
         """
         Возвращает similarity для ВСЕХ чанков в базе — без LIMIT.
         Полезно для визуализации «как ранжируется вся база на этот запрос»:
@@ -565,16 +775,18 @@ class VectorStore:
         На большой базе так делать нельзя (это полный скан), но для учебных
         21 чанка — копейки.
         """
-        sql = """
+        chat_clause, chat_params = _chat_id_where(chat_id)
+        sql = f"""
             SELECT
                 source,
                 chunk_index,
                 1 - (embedding <=> %s::vector) AS similarity
             FROM chunks
+            {chat_clause}
             ORDER BY similarity DESC
         """
         with self._conn.cursor() as cur:
-            cur.execute(sql, (query_embedding,))
+            cur.execute(sql, (query_embedding,) + chat_params)
             rows = cur.fetchall()
         return [
             ScoredChunk(

@@ -1,0 +1,102 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 220 14% 8%;
+    --foreground: 220 10% 92%;
+    --card: 220 14% 11%;
+    --card-foreground: 220 10% 92%;
+    --popover: 220 14% 10%;
+    --popover-foreground: 220 10% 92%;
+    --primary: 217 91% 71%;
+    --primary-foreground: 220 14% 8%;
+    --secondary: 220 14% 14%;
+    --secondary-foreground: 220 10% 92%;
+    --muted: 220 14% 16%;
+    --muted-foreground: 220 8% 60%;
+    --accent: 220 14% 16%;
+    --accent-foreground: 220 10% 92%;
+    --destructive: 30 80% 60%;
+    --destructive-foreground: 220 14% 8%;
+    --border: 220 14% 18%;
+    --input: 220 14% 14%;
+    --ring: 217 91% 71%;
+    --radius: 0.6rem;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html, body {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+}
+
+/* Скролл-стилизация чтобы не было системной полоски */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: hsl(var(--muted));
+  border-radius: 6px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--border));
+}
+
+/* react-markdown — базовая стилизация контента */
+.prose-rag {
+  @apply text-foreground leading-relaxed;
+}
+.prose-rag p { @apply mb-2; }
+.prose-rag p:last-child { @apply mb-0; }
+.prose-rag h1, .prose-rag h2, .prose-rag h3 { @apply font-semibold mt-3 mb-2; }
+.prose-rag h1 { @apply text-lg; }
+.prose-rag h2 { @apply text-base; }
+.prose-rag ul, .prose-rag ol { @apply ml-5 mb-2; }
+.prose-rag ul { @apply list-disc; }
+.prose-rag ol { @apply list-decimal; }
+.prose-rag li { @apply mb-1; }
+.prose-rag code {
+  @apply bg-muted px-1 py-0.5 rounded text-[0.85em] font-mono;
+}
+.prose-rag pre {
+  @apply bg-muted p-3 rounded my-2 overflow-x-auto;
+}
+.prose-rag pre code {
+  @apply bg-transparent p-0;
+}
+.prose-rag a {
+  @apply text-primary hover:underline;
+}
+
+/* Citation chip — кликабельная [N] в ответе LLM */
+.citation-chip {
+  @apply inline-block px-1.5 py-0 mx-0.5 rounded text-[0.8em] font-mono
+         bg-primary/15 text-primary border border-primary/40
+         cursor-pointer hover:bg-primary/25 transition-colors;
+}
+.citation-chip.dead {
+  @apply bg-destructive/10 text-destructive border-destructive/40;
+}
+
+/* Flash-анимация для чанка на который кликнули */
+@keyframes chunk-flash {
+  0%   { box-shadow: 0 0 0 2px hsl(var(--primary)), 0 0 16px hsl(var(--primary) / 0.4); }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+.chunk-flash {
+  animation: chunk-flash 1.5s ease-out;
+}

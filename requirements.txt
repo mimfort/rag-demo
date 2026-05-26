@@ -25,6 +25,12 @@ fastapi>=0.115,<1.0
 # (websockets, httptools, watchfiles) — не обязательны, но удобны.
 uvicorn[standard]>=0.30,<1.0
 
+# --- Загрузка файлов через UI ---
+# Парсер PDF для endpoint POST /api/upload.
+pypdf>=5.0,<7.0
+# FastAPI multipart form parser (UploadFile через File(...)).
+python-multipart>=0.0.20,<1.0
+
 # --- Reranker (cross-encoder через sentence-transformers) ---
 # Тянет torch и transformers (~2 ГБ суммарно). Используется только в
 # rag/reranker.py — если reranking не нужен, можно эту строку убрать.

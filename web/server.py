@@ -30,18 +30,30 @@ import time
 from pathlib import Path
 from typing import Iterator
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+
+from rag.chunker import chunk_text
+from rag.loaders import (
+    MAX_UPLOAD_BYTES,
+    SUPPORTED_EXTENSIONS,
+    UnsupportedFile,
+    load_text,
+)
+from rag.vector_store import ChunkInput
 
 from rag.config import settings
 from rag.embedder import LMStudioEmbedder
 from rag.generator import LMStudioGenerator, build_user_prompt
 from rag.decomposer import QueryDecomposer
+from rag.history import ChatHistoryStore, Message, make_standalone_query
 from rag.mmr import mmr_select
 from rag.reranker import CrossEncoderReranker
 from rag.rewriter import QueryRewriter
+from rag.router import QueryRouter, RouteDecision
 from rag.vector_store import RetrievedChunk, ScoredChunk, VectorStore, RRF_K
 from evals.metrics import ChunkKey, QueryMetrics, aggregate, score_query
 from evals.runner import (
@@ -92,6 +104,19 @@ def vec_dot(a: list[float], b: list[float]) -> float:
 # ---------------------------------------------------------------------------
 app = FastAPI(title="RAG demo", version="1.0")
 
+# CORS — фронт на :3000 ходит на :8000 напрямую (минует Next.js dev-proxy,
+# который буферизует SSE). Для production-деплоя origins расширятся.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Эти объекты заполнятся в startup-хендлере ниже.
 _embedder: LMStudioEmbedder | None = None
 _store: VectorStore | None = None
@@ -99,6 +124,8 @@ _generator: LMStudioGenerator | None = None
 _reranker: CrossEncoderReranker | None = None
 _decomposer: QueryDecomposer | None = None
 _rewriter: QueryRewriter | None = None
+_history_store: ChatHistoryStore | None = None
+_router: QueryRouter | None = None
 
 
 @app.on_event("startup")
@@ -113,6 +140,7 @@ def _startup() -> None:
     просто rerank-параметр будет отдавать 503.
     """
     global _embedder, _store, _generator, _reranker, _decomposer, _rewriter
+    global _history_store, _router
     _embedder = LMStudioEmbedder()
     _store = VectorStore()
     _generator = LMStudioGenerator()
@@ -120,6 +148,10 @@ def _startup() -> None:
     # endpoint /chat/completions). Стартуют мгновенно.
     _decomposer = QueryDecomposer(_generator)
     _rewriter = QueryRewriter(_generator)
+    # History store использует то же psycopg-соединение что и VectorStore.
+    _history_store = ChatHistoryStore(_store._conn)
+    # Router — тот же HTTP-клиент chat-модели, классифицирует запросы.
+    _router = QueryRouter(_generator)
     try:
         _reranker = CrossEncoderReranker()
     except Exception as exc:
@@ -194,6 +226,16 @@ class AskRequest(BaseModel):
     rewrite: bool = Field(default=False)
     # Сколько формулировок генерировать (включая исходную). 1 = no-op.
     rewrite_n: int = Field(default=3, ge=1, le=5)
+    # Conversation mode. Если передан — система:
+    #   1) загружает последние сообщения чата и переформулирует текущий
+    #      запрос в standalone-вид (резолвит «это», «он», «расскажи подробнее»);
+    #   2) при retrieve видит общую базу + приватные чанки этого чата;
+    #   3) сохраняет user-вопрос и assistant-ответ в messages.
+    chat_id: str | None = None
+    # Auto-router: классифицировать запрос ПЕРЕД retrieve. Если intent не
+    # "knowledge" — отвечаем напрямую без RAG. Экономит время на chitchat
+    # и meta-вопросах.
+    auto_route: bool = False
 
 
 class ChunkOut(BaseModel):
@@ -264,6 +306,20 @@ class ExplainOut(BaseModel):
     context_expanded: bool = False
     expand_radius: int | None = None
     neighbors_added: int = 0  # сколько уникальных соседних чанков подмешано
+    # ── conversation mode (history-aware standalone rewrite) ──────
+    chat_id: str | None = None
+    standalone_query: str | None = None  # переписанный запрос (если был history)
+    standalone_changed: bool = False
+    standalone_ms: float | None = None
+    history_used: int = 0  # сколько сообщений учтено
+    # ── auto-router (классификатор запроса) ───────────────────────
+    routed: bool = False           # делалась ли классификация
+    route_intent: str | None = None  # "knowledge" | "chitchat" | "meta" | "other"
+    route_reason: str | None = None
+    route_ms: float | None = None
+    route_fallback: bool = False   # был ли fallback на knowledge
+    # Если интент не knowledge — RAG-этапы пропущены.
+    rag_skipped: bool = False
     # ── query rewriting ────────────────────────────────────────────
     rewritten: bool = False             # реально ли сгенерировали >1 формулировку
     rewrite_status: str = "off"         # "off" | "rewritten" | "failed"
@@ -316,6 +372,7 @@ def _multi_query_per_subq_rerank(
     subqueries: list[str],
     top_k: int,
     candidate_per_subq: int = 15,
+    chat_id: str | None = None,
 ) -> list[RetrievedChunk]:
     """
     Per-subquery rerank: для КАЖДОГО подзапроса делаем
@@ -350,6 +407,7 @@ def _multi_query_per_subq_rerank(
             subq, subq_vec,
             top_k=candidate_per_subq,
             candidate_n=20,
+            chat_id=chat_id,
         )
         # Reranker по ЭТОМУ подзапросу.
         ranked = _reranker.rerank(subq, cand, top_k=per_subq_take)
@@ -374,6 +432,7 @@ def _multi_query_hybrid(
     subqueries: list[str],
     top_k: int,
     candidate_per_subq: int,
+    chat_id: str | None = None,
 ) -> list[RetrievedChunk]:
     """
     Запускает hybrid_search для каждого подзапроса и сливает результаты
@@ -401,6 +460,7 @@ def _multi_query_hybrid(
             subq, subq_vec,
             top_k=candidate_per_subq,
             candidate_n=20,
+            chat_id=chat_id,
         )
         for rank, hit in enumerate(hits, start=1):
             key = (hit.source, hit.chunk_index)
@@ -496,6 +556,7 @@ def _retrieve_with_explain(
     expand_radius: int = 1,
     rewrite: bool = False,
     rewrite_n: int = 3,
+    chat_id: str | None = None,
 ) -> tuple[list[RetrievedChunk], list[RetrievedChunk], ExplainOut]:
     """
     Делает весь retrieval-цикл и собирает образовательный отчёт.
@@ -622,6 +683,7 @@ def _retrieve_with_explain(
             subqueries,
             top_k=pool_size,
             candidate_per_subq=RERANK_CANDIDATE_N,
+            chat_id=chat_id,
         )
         rerank_ms_inline = round((time.perf_counter() - t_rr) * 1000.0, 1)
     elif rewrite_active and len(rewrites) > 1:
@@ -633,17 +695,21 @@ def _retrieve_with_explain(
             rewrites,
             top_k=fetch_n,
             candidate_per_subq=max(fetch_n, 10),
+            chat_id=chat_id,
         )
     elif decompose and len(subqueries) > 1:
         chunks = _multi_query_hybrid(
             subqueries,
             top_k=fetch_n,
             candidate_per_subq=max(fetch_n, 10),
+            chat_id=chat_id,
         )
     elif search_mode == "vector":
-        chunks = _store.search(query_vec, top_k=fetch_n, include_embeddings=True)
+        chunks = _store.search(
+            query_vec, top_k=fetch_n, include_embeddings=True, chat_id=chat_id,
+        )
     elif search_mode == "text":
-        text_hits = _store.text_search(query, top_n=fetch_n)
+        text_hits = _store.text_search(query, top_n=fetch_n, chat_id=chat_id)
         chunks = [
             RetrievedChunk(
                 source=h.source,
@@ -657,7 +723,7 @@ def _retrieve_with_explain(
         ]
     else:  # hybrid
         chunks = _store.hybrid_search(
-            query, query_vec, top_k=fetch_n, candidate_n=20
+            query, query_vec, top_k=fetch_n, candidate_n=20, chat_id=chat_id,
         )
 
     # 2.5. Reranking — опционально. Три случая:
@@ -745,7 +811,7 @@ def _retrieve_with_explain(
     # 3. Similarity для ВСЕХ чанков базы — для гистограммы в UI.
     #    Не зависит от search_mode: гистограмма всегда показывает cosine,
     #    это «карта семантической близости» базы к запросу.
-    all_scores = _store.score_all(query_vec)
+    all_scores = _store.score_all(query_vec, chat_id=chat_id)
 
     # 4. Образовательные числа для top-1.
     q_norm = vec_norm(query_vec)
@@ -826,18 +892,263 @@ def health() -> dict:
     return {"ok": True, "chunks_in_db": _store.count() if _store else 0}
 
 
+_CHITCHAT_SYSTEM = (
+    "Ты — дружелюбный ассистент. Отвечай коротко и тепло на простые социальные "
+    "реплики (приветствия, благодарности, прощания). Не выдумывай ничего "
+    "лишнего, не задавай встречных вопросов про базу знаний."
+)
+
+_META_SYSTEM = (
+    "Ты — ассистент, который отвечает на вопросы пользователя про сам диалог. "
+    "Используй переданную историю чата чтобы ответить, что говорил пользователь "
+    "ранее, что ты ему отвечал, повторить или объяснить проще предыдущий ответ. "
+    "Если в истории нет нужной информации — честно скажи об этом."
+)
+
+_OTHER_SYSTEM = (
+    "Ты — ассистент локальной базы знаний по технической документации. "
+    "Пользователь задал вопрос вне темы базы (например про погоду, новости, "
+    "личные дела). Вежливо объясни что не можешь ответить на этот вопрос — "
+    "у тебя есть только техническая документация. Не выдумывай ответ."
+)
+
+
+def _generate_direct_answer(
+    query: str,
+    history: list[Message] | None,
+    intent: str,
+    stream: bool = False,
+):
+    """
+    Прямой ответ LLM без RAG-контекста. system-prompt подбирается под intent.
+    Для intent=meta история диалога подаётся как контекст в user-message.
+
+    Если stream=True — возвращает итератор кусков; иначе строку.
+    """
+    assert _generator is not None
+    if intent == "chitchat":
+        system = _CHITCHAT_SYSTEM
+    elif intent == "meta":
+        system = _META_SYSTEM
+    elif intent == "other":
+        system = _OTHER_SYSTEM
+    else:
+        # Шафтовая защита: пришёл не-поддерживаемый intent — отвечаем нейтрально.
+        system = _CHITCHAT_SYSTEM
+
+    # Для meta даём явную историю в user-промпте, иначе LLM не сможет
+    # сослаться на «предыдущие сообщения».
+    if intent == "meta" and history:
+        hist_block = "\n".join(
+            f"{m.role}: {m.content}" for m in history
+        )
+        user_content = (
+            f"История диалога:\n{hist_block}\n\n"
+            f"Текущий вопрос пользователя: {query}"
+        )
+    else:
+        user_content = query
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user_content},
+    ]
+    payload = {
+        "model": _generator._model,
+        "stream": stream,
+        "temperature": 0.4,
+        "max_tokens": 512,
+        "messages": messages,
+    }
+    url = f"{_generator._base_url}/chat/completions"
+
+    if not stream:
+        response = _generator._client.post(url, json=payload)
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"] or ""
+
+    # Streaming-режим — повторяем логику generate_stream.
+    def gen():
+        with _generator._client.stream("POST", url, json=payload) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line or not line.startswith("data: "):
+                    continue
+                data_str = line[len("data: "):].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    payload_chunk = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                choices = payload_chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                piece = delta.get("content")
+                if piece:
+                    yield piece
+    return gen()
+
+
+def _resolve_standalone(
+    query: str, chat_id: str | None
+) -> tuple[str, dict]:
+    """
+    Если есть chat_id и в его истории что-то есть — переформулируем
+    текущий запрос в standalone-вид через LLM. Возвращаем (новый_запрос,
+    info_для_explain).
+    """
+    if not chat_id or _history_store is None or _generator is None:
+        return query, {
+            "standalone_query": None,
+            "standalone_changed": False,
+            "standalone_ms": None,
+            "history_used": 0,
+        }
+    history = _history_store.get_recent(chat_id, limit=6)
+    if not history:
+        return query, {
+            "standalone_query": None,
+            "standalone_changed": False,
+            "standalone_ms": None,
+            "history_used": 0,
+        }
+    t0 = time.perf_counter()
+    res = make_standalone_query(_generator, history, query)
+    standalone_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+    return res.standalone, {
+        "standalone_query": res.standalone,
+        "standalone_changed": res.changed,
+        "standalone_ms": standalone_ms,
+        "history_used": len(history),
+    }
+
+
+def _route_query(
+    query: str, chat_id: str | None,
+) -> tuple[RouteDecision | None, dict]:
+    """
+    Запускает классификатор запроса. Возвращает (decision, info_для_explain).
+    Если auto_route выключен снаружи — эту функцию вообще не зовут.
+    """
+    if _router is None:
+        return None, {}
+    history = []
+    if chat_id and _history_store is not None:
+        history = _history_store.get_recent(chat_id, limit=4)
+
+    t0 = time.perf_counter()
+    decision = _router.classify(query, history=history)
+    route_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+    return decision, {
+        "routed": True,
+        "route_intent": decision.intent,
+        "route_reason": decision.reason,
+        "route_ms": route_ms,
+        "route_fallback": decision.fallback,
+    }
+
+
+def _save_chat_messages(
+    chat_id: str | None,
+    user_q: str,
+    assistant_a: str,
+    *,
+    chunks: list | None = None,
+    explain: dict | None = None,
+    prompt: str | None = None,
+) -> None:
+    """Сохраняем пару сообщений в историю чата (если chat_id передан).
+    Для assistant-сообщения дополнительно пишем pipeline-снимок —
+    UI потом перерисует «шаги думания» после перезагрузки."""
+    if not chat_id or _history_store is None:
+        return
+    _history_store.save_message(chat_id, "user", user_q)
+    _history_store.save_message(
+        chat_id,
+        "assistant",
+        assistant_a,
+        chunks=chunks,
+        explain=explain,
+        prompt=prompt,
+    )
+
+
+def _empty_explain(**overrides) -> ExplainOut:
+    """
+    Минимальная заглушка для direct-answer-режима, чтобы UI не падал.
+    Поля retrieve-этапа остаются дефолтными (нулевыми), conversation-поля
+    можно дозаполнить через overrides.
+    """
+    assert _embedder is not None
+    return ExplainOut(
+        embed_model=settings.embedding_model,
+        embed_dim=settings.embedding_dim,
+        embed_ms=0.0,
+        query_norm=0.0,
+        query_preview=[],
+        all_scores=[],
+        min_similarity=0.0,
+        below_threshold=False,
+        search_mode="skipped",
+        reranked=False,
+        decomposed=False,
+        rag_skipped=True,
+        **overrides,
+    )
+
+
 @app.post("/api/ask", response_model=AskResponse)
 def ask(req: AskRequest) -> AskResponse:
     """Обычный (нестриминговый) RAG-запрос."""
     assert _generator is not None  # для тайп-чекера
 
+    # 0a. Router: классифицируем intent. Если включён и intent != knowledge —
+    #     пропускаем RAG, отвечаем напрямую.
+    route_info: dict = {}
+    if req.auto_route:
+        decision, route_info = _route_query(req.query, req.chat_id)
+        if decision is not None and decision.intent != "knowledge":
+            # Прямой ответ без retrieve.
+            history = (
+                _history_store.get_recent(req.chat_id, limit=8)
+                if req.chat_id and _history_store else []
+            )
+            answer = _generate_direct_answer(
+                req.query, history, decision.intent, stream=False,
+            )
+            explain = _empty_explain(
+                chat_id=req.chat_id, **route_info,
+            )
+            # Сохраняем без chunks/prompt — RAG не запускался,
+            # но explain (с router-решением) полезен для UI.
+            _save_chat_messages(
+                req.chat_id, req.query, answer,
+                explain=explain.model_dump(),
+            )
+            return AskResponse(
+                chunks=[], prompt="", answer=answer, explain=explain,
+            )
+
+    # 0b. Conversation-mode препроцессинг: history-aware standalone rewrite.
+    effective_query, standalone_info = _resolve_standalone(req.query, req.chat_id)
+
     chunks, chunks_for_prompt, explain = _retrieve_with_explain(
-        req.query, req.top_k, req.min_similarity, req.search_mode,
+        effective_query, req.top_k, req.min_similarity, req.search_mode,
         req.rerank, req.decompose, req.rerank_per_subquery,
         req.mmr, req.mmr_lambda, req.min_rerank_score,
         req.expand_context, req.expand_radius,
         req.rewrite, req.rewrite_n,
+        chat_id=req.chat_id,
     )
+    # Дописываем conversation-поля в explain (Pydantic не даёт мутировать
+    # frozen-объекты — создаём копию через model_copy с update).
+    explain = explain.model_copy(update={
+        "chat_id": req.chat_id,
+        **standalone_info,
+        **route_info,  # router-инфо (пусто если auto_route выключен)
+    })
     if not chunks:
         raise HTTPException(
             status_code=400,
@@ -846,8 +1157,21 @@ def ask(req: AskRequest) -> AskResponse:
     # Промпт и ответ строим на расширенных чанках (с соседями, если был
     # expand_context). В UI отдаём оригинальные «центральные» чанки —
     # пользователь видит что именно retrieval нашёл, без раздувания.
-    prompt = build_user_prompt(req.query, chunks_for_prompt)
-    answer = _generator.generate(req.query, chunks_for_prompt)
+    prompt = build_user_prompt(effective_query, chunks_for_prompt)
+    answer = _generator.generate(effective_query, chunks_for_prompt)
+
+    # Сохраняем оба сообщения в истории чата (если chat_id задан).
+    # Пишем ИСХОДНЫЙ user-вопрос (а не standalone-переписанный) —
+    # пользователь увидит свой текст в истории, а не машинный перепев.
+    # Для assistant пишем полный pipeline-снимок (chunks/explain/prompt)
+    # чтобы можно было показать «как я дошёл до ответа» после рестарта.
+    _save_chat_messages(
+        req.chat_id, req.query, answer,
+        chunks=[c.model_dump() for c in _to_chunk_out(chunks)],
+        explain=explain.model_dump(),
+        prompt=prompt,
+    )
+
     return AskResponse(
         chunks=_to_chunk_out(chunks),
         prompt=prompt,
@@ -890,6 +1214,8 @@ def ask_stream(
     expand_radius: int = 1,
     rewrite: bool = False,
     rewrite_n: int = 3,
+    chat_id: str | None = None,
+    auto_route: bool = False,
 ) -> StreamingResponse:
     """
     Streaming-версия. Шлёт три типа событий:
@@ -904,13 +1230,61 @@ def ask_stream(
     if not query.strip():
         raise HTTPException(status_code=400, detail="query пуст")
 
+    # 0a. Router: классифицируем intent. Если включён и intent != knowledge —
+    #     стримим прямой ответ без retrieve-этапа.
+    route_info: dict = {}
+    direct_intent: str | None = None
+    if auto_route:
+        decision, route_info = _route_query(query, chat_id)
+        if decision is not None and decision.intent != "knowledge":
+            direct_intent = decision.intent
+
+    if direct_intent is not None:
+        # Streaming-ветка для chitchat/meta/other.
+        history = (
+            _history_store.get_recent(chat_id, limit=8)
+            if chat_id and _history_store else []
+        )
+        explain = _empty_explain(chat_id=chat_id, **route_info)
+
+        def direct_event_source() -> Iterator[str]:
+            yield _sse_event("meta", {
+                "chunks": [],
+                "prompt": "",
+                "explain": explain.model_dump(),
+            })
+            full = []
+            for piece in _generate_direct_answer(
+                query, history, direct_intent, stream=True,
+            ):
+                full.append(piece)
+                yield _sse_event("token", {"text": piece})
+            _save_chat_messages(
+                chat_id, query, "".join(full),
+                explain=explain.model_dump(),
+            )
+            yield _sse_event("done", {})
+
+        return StreamingResponse(
+            direct_event_source(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    # 0b. Conversation-mode препроцессинг: history-aware standalone rewrite.
+    effective_query, standalone_info = _resolve_standalone(query, chat_id)
+
     chunks, chunks_for_prompt, explain = _retrieve_with_explain(
-        query, top_k, min_similarity, search_mode,
+        effective_query, top_k, min_similarity, search_mode,
         rerank, decompose, rerank_per_subquery,
         mmr, mmr_lambda, min_rerank_score,
         expand_context, expand_radius,
         rewrite, rewrite_n,
+        chat_id=chat_id,
     )
+    explain = explain.model_copy(update={
+        "chat_id": chat_id, **standalone_info, **route_info,
+    })
 
     def event_source() -> Iterator[str]:
         # 1. Сначала отдаём «meta»: что нашли, промпт и explain-блок.
@@ -918,11 +1292,14 @@ def ask_stream(
         #    легко забыть какое-нибудь поле когда схема расширяется.
         #    В UI отдаём оригинальные центральные чанки, а в промпт —
         #    расширенные соседями (если включён expand_context).
+        # Считаем промпт один раз — отдадим в meta И сохраним в БД для history.
+        prompt_text = build_user_prompt(effective_query, chunks_for_prompt)
+        chunks_serializable = [c.model_dump() for c in _to_chunk_out(chunks)]
+        explain_dict = explain.model_dump()
         meta_payload = {
-            "chunks": [c.model_dump() for c in _to_chunk_out(chunks)],
-            "prompt": build_user_prompt(query, chunks_for_prompt),
-            # Pydantic.model_dump() даёт обычный dict — его легко уложить в JSON.
-            "explain": explain.model_dump(),
+            "chunks": chunks_serializable,
+            "prompt": prompt_text,
+            "explain": explain_dict,
         }
         yield _sse_event("meta", meta_payload)
 
@@ -935,11 +1312,24 @@ def ask_stream(
             yield _sse_event("done", {})
             return
 
-        # 2. Стримим токены ответа. LLM получает расширенный контекст.
-        for piece in _generator.generate_stream(query, chunks_for_prompt):
+        # 2. Стримим токены ответа. LLM получает расширенный контекст
+        #    и (если был history) standalone-переписанный запрос.
+        full_answer_parts: list[str] = []
+        for piece in _generator.generate_stream(effective_query, chunks_for_prompt):
+            full_answer_parts.append(piece)
             yield _sse_event("token", {"text": piece})
 
-        # 3. Сигнал конца.
+        # 3. Сохраняем сообщения в историю (если работаем в чате) с полным
+        #    pipeline-снимком. После refresh UI восстановит шаги.
+        full_answer = "".join(full_answer_parts)
+        _save_chat_messages(
+            chat_id, query, full_answer,
+            chunks=chunks_serializable,
+            explain=explain_dict,
+            prompt=prompt_text,
+        )
+
+        # 4. Сигнал конца.
         yield _sse_event("done", {})
 
     # Важные заголовки для SSE:
@@ -954,6 +1344,274 @@ def ask_stream(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Chats и messages — conversation mode.
+# ---------------------------------------------------------------------------
+import uuid
+
+
+class ChatOut(BaseModel):
+    id: str
+    title: str
+    created_at: str | None = None
+
+
+class MessageOut(BaseModel):
+    role: str
+    content: str
+    created_at: str | None = None
+    # Опциональные данные о retrieval-pipeline (только для assistant-сообщений).
+    # Позволяют UI перерендерить «шаги думания» после перезагрузки страницы.
+    chunks: list | None = None
+    explain: dict | None = None
+    prompt: str | None = None
+
+
+class CreateChatRequest(BaseModel):
+    title: str | None = Field(default=None, max_length=200)
+
+
+def _generate_chat_title(query: str) -> str:
+    """
+    Простой эвристический заголовок чата из первого вопроса.
+    Берём первые ~60 символов, схлопываем пробелы. Без LLM —
+    это быстрее и стабильнее (не лезем в Gemma на каждый новый чат).
+    """
+    title = " ".join((query or "").split())[:60]
+    return title or "Без названия"
+
+
+@app.post("/api/chats", response_model=ChatOut)
+def create_chat(req: CreateChatRequest) -> ChatOut:
+    """Создаёт новый чат с заданным или дефолтным заголовком."""
+    assert _store is not None
+    chat_id = str(uuid.uuid4())
+    title = (req.title or "Новый чат").strip() or "Новый чат"
+    with _store._conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO chats (id, title) VALUES (%s, %s) "
+            "RETURNING created_at",
+            (chat_id, title),
+        )
+        row = cur.fetchone()
+    created_at = row[0].isoformat() if row and row[0] is not None else None
+    return ChatOut(id=chat_id, title=title, created_at=created_at)
+
+
+@app.get("/api/chats", response_model=list[ChatOut])
+def list_chats() -> list[ChatOut]:
+    """Все чаты, новые сверху."""
+    assert _store is not None
+    with _store._conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, title, created_at FROM chats ORDER BY created_at DESC"
+        )
+        rows = cur.fetchall()
+    return [
+        ChatOut(
+            id=r[0],
+            title=r[1],
+            created_at=r[2].isoformat() if r[2] is not None else None,
+        )
+        for r in rows
+    ]
+
+
+@app.delete("/api/chats/{chat_id}")
+def delete_chat(chat_id: str) -> dict:
+    """
+    Удаляет чат вместе с его сообщениями (CASCADE на FK) и его
+    приватными чанками (chunks.chat_id = ...).
+    """
+    assert _store is not None
+    with _store._conn.cursor() as cur:
+        # 1) приватные чанки этого чата
+        cur.execute("DELETE FROM chunks WHERE chat_id = %s", (chat_id,))
+        chunks_deleted = cur.rowcount
+        # 2) сам чат (messages снесутся каскадом)
+        cur.execute("DELETE FROM chats WHERE id = %s", (chat_id,))
+        chat_deleted = cur.rowcount
+    return {
+        "chat_id": chat_id,
+        "deleted": chat_deleted > 0,
+        "chunks_deleted": chunks_deleted,
+    }
+
+
+@app.get("/api/chats/{chat_id}/messages", response_model=list[MessageOut])
+def list_messages(chat_id: str, limit: int = 100) -> list[MessageOut]:
+    """Последние N сообщений чата в хронологическом порядке.
+    Возвращаем с полными pipeline-данными — UI рендерит шаги для
+    каждого assistant-сообщения, не только последнего."""
+    assert _history_store is not None
+    msgs = _history_store.get_recent(chat_id, limit=limit, with_details=True)
+    return [
+        MessageOut(
+            role=m.role,
+            content=m.content,
+            created_at=m.created_at,
+            chunks=m.chunks,
+            explain=m.explain,
+            prompt=m.prompt,
+        )
+        for m in msgs
+    ]
+
+
+@app.post("/api/admin/cleanup")
+def cleanup_old_chats(days: int = 7) -> dict:
+    """
+    Удаляет чаты и их приватные данные старше N дней.
+
+    Что чистится:
+      - chats старше days дней (messages удаляются каскадно)
+      - chunks с chat_id != NULL у удалённых чатов (chunks не имеют FK,
+        поэтому удаляем отдельно)
+      - «сиротские» приватные чанки чатов, которых уже нет
+
+    Общая база (chunks.chat_id IS NULL) НЕ трогается никогда.
+
+    В production обычно вызывают по cron каждый час. В нашем демо —
+    ручной endpoint, удобно дёрнуть из curl при тестах.
+    """
+    assert _store is not None
+    with _store._conn.cursor() as cur:
+        # 1) сиротские приватные чанки (чат уже удалён, чанки висят)
+        cur.execute(
+            "DELETE FROM chunks WHERE chat_id IS NOT NULL AND chat_id NOT IN "
+            "(SELECT id FROM chats)"
+        )
+        orphans = cur.rowcount
+        # 2) старые чаты — каскад снесёт messages
+        cur.execute(
+            "DELETE FROM chats WHERE created_at < now() - "
+            "(%s * interval '1 day')",
+            (days,),
+        )
+        old_chats = cur.rowcount
+        # 3) приватные чанки уже несуществующих чатов (после step 2)
+        cur.execute(
+            "DELETE FROM chunks WHERE chat_id IS NOT NULL AND chat_id NOT IN "
+            "(SELECT id FROM chats)"
+        )
+        more_orphans = cur.rowcount
+    return {
+        "days_threshold": days,
+        "orphan_chunks_before": orphans,
+        "old_chats_deleted": old_chats,
+        "chunks_deleted_after": more_orphans,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Загрузка файлов и управление источниками.
+# ---------------------------------------------------------------------------
+class SourceOut(BaseModel):
+    """Описание источника в списке."""
+    source: str
+    chunks: int
+    created_at: str | None = None
+    chat_id: str | None = None
+
+
+class UploadResult(BaseModel):
+    source: str
+    chunks: int
+
+
+def _index_text(text: str, source: str, chat_id: str | None = None) -> int:
+    """
+    Общая логика «текст → чанки → эмбеддинги → INSERT».
+    Идемпотентна: сначала удаляет старые чанки этого `source` (с тем же
+    chat_id), потом вставляет новые. Возвращает количество чанков.
+    """
+    assert _embedder is not None and _store is not None
+    chunks = chunk_text(
+        text,
+        chunk_size=settings.chunk_size,
+        overlap=settings.chunk_overlap,
+    )
+    if not chunks:
+        return 0
+
+    # Idempotent re-ingest: удаляем именно ту версию которая загружается.
+    # При chat_id=None — удаляем версию из общей базы; иначе только из
+    # этого чата. Версии в других чатах не трогаем.
+    _store.delete_source(source, chat_id=chat_id)
+
+    # Эмбеддинги — пачками, чтобы не плодить HTTP-вызовы.
+    BATCH = 16
+    records: list[ChunkInput] = []
+    for start in range(0, len(chunks), BATCH):
+        batch = chunks[start : start + BATCH]
+        vectors = _embedder.embed_many([c.text for c in batch])
+        for chunk, vec in zip(batch, vectors):
+            records.append(ChunkInput(
+                source=source,
+                chunk_index=chunk.index,
+                content=chunk.text,
+                embedding=vec,
+                chat_id=chat_id,
+            ))
+    _store.insert_chunks(records)
+    return len(records)
+
+
+@app.get("/api/sources", response_model=list[SourceOut])
+def list_sources(chat_id: str | None = None) -> list[SourceOut]:
+    """
+    Возвращает список загруженных источников.
+    Без chat_id — показывает общую базу (chat_id IS NULL).
+    """
+    assert _store is not None
+    rows = _store.list_sources(chat_id=chat_id)
+    return [SourceOut(**r) for r in rows]
+
+
+@app.post("/api/upload", response_model=UploadResult)
+async def upload_file(
+    file: UploadFile = File(...),
+    chat_id: str | None = None,
+) -> UploadResult:
+    """
+    Принимает один файл (.md/.txt/.pdf), парсит его в текст, чанкует,
+    эмбеддит и сохраняет в БД.
+
+    Idempotent: повторная загрузка с тем же именем заменяет старые чанки.
+    chat_id оставляем как опцию для будущего chat-режима — сейчас все
+    загрузки идут в общую базу (chat_id=NULL).
+    """
+    if file.filename is None:
+        raise HTTPException(400, "Не указано имя файла")
+
+    data = await file.read()
+
+    try:
+        text = load_text(file.filename, data)
+    except UnsupportedFile as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    # Имя источника — оригинальное имя файла. Не делаем cwd-санитации,
+    # потому что в БД оно — просто текст, не путь.
+    n_chunks = _index_text(text, source=file.filename, chat_id=chat_id)
+    if n_chunks == 0:
+        raise HTTPException(
+            400,
+            "Файл прочитан, но не дал чанков (возможно пустой текст)",
+        )
+    return UploadResult(source=file.filename, chunks=n_chunks)
+
+
+@app.delete("/api/sources/{source}")
+def delete_source(source: str) -> dict:
+    """
+    Удаляет все чанки указанного источника. Возвращает счётчик удалённого.
+    """
+    assert _store is not None
+    deleted = _store.delete_source(source)
+    return {"source": source, "deleted": deleted}
 
 
 # ---------------------------------------------------------------------------
