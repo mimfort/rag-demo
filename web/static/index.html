@@ -301,13 +301,42 @@
     table.metrics th, table.metrics td {
       padding: 8px 10px;
       border-bottom: 1px solid var(--border);
-      text-align: right;
+      text-align: right;  /* числа всегда справа */
     }
-    table.metrics th { text-align: left; color: var(--muted); font-weight: 500; }
+    /* Заголовки наследуют text-align: right из правила выше — это нужно
+       чтобы заголовок колонки стоял ровно над её значениями. Первая
+       колонка (config/tag) — единственное исключение, она слева. */
+    table.metrics th { color: var(--muted); font-weight: 500; }
     table.metrics td:first-child, table.metrics th:first-child { text-align: left; }
     table.metrics td.best { color: var(--green); font-weight: 700; }
     table.metrics td.worst { color: var(--orange); }
     table.metrics tr.row-name { color: var(--accent); }
+
+    /* Чипы подзапросов в блоке декомпозиции */
+    .subq-list { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+    .subq-chip {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--accent);
+      border-radius: 6px;
+      font-size: 13px;
+      color: var(--text);
+    }
+    .subq-chip .num {
+      font: 11px var(--mono);
+      color: var(--accent);
+      background: rgba(122, 162, 247, 0.15);
+      padding: 1px 6px;
+      border-radius: 3px;
+      flex-shrink: 0;
+    }
+    .subq-trivial {
+      color: var(--muted); font-style: italic; font-size: 13px;
+    }
     .metric-help {
       font-size: 12px;
       color: var(--muted);
@@ -320,6 +349,61 @@
     }
     .eval-controls .checkbox { font-size: 13px; }
     button.eval-btn { padding: 8px 14px; font-size: 14px; }
+
+    /* Tooltip: элементы с атрибутом data-tip получают всплывающую подсказку.
+       Чистый CSS, ничего на JS навешивать не надо. */
+    [data-tip] {
+      position: relative;
+      cursor: help;
+      border-bottom: 1px dotted var(--muted);
+    }
+    /* Для бейджей в карточках чанков пунктирная линия снизу избыточна —
+       у них и так свой border. Убираем перебивание. */
+    .badge-mini[data-tip] {
+      border-bottom-style: solid;
+    }
+    [data-tip]::after {
+      content: attr(data-tip);
+      position: absolute;
+      bottom: calc(100% + 8px);
+      left: 50%;
+      transform: translateX(-50%);
+      background: #0a0c10;
+      color: var(--text);
+      border: 1px solid var(--accent);
+      padding: 8px 10px;
+      border-radius: 6px;
+      font: 12px/1.45 -apple-system, "Segoe UI", Roboto, sans-serif;
+      font-weight: 400;
+      white-space: normal;
+      width: max-content;
+      max-width: 320px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.1s 0.15s;
+      z-index: 100;
+      text-align: left;
+      letter-spacing: normal;
+      text-transform: none;
+    }
+    [data-tip]::before {
+      content: "";
+      position: absolute;
+      bottom: calc(100% + 2px);
+      left: 50%;
+      transform: translateX(-50%);
+      border: 6px solid transparent;
+      border-top-color: var(--accent);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.1s 0.15s;
+      z-index: 100;
+    }
+    [data-tip]:hover::after,
+    [data-tip]:hover::before {
+      opacity: 1;
+    }
 
     /* Citation chip [N] внутри ответа LLM */
     .citation {
@@ -411,6 +495,101 @@
       </div>
 
       <div style="margin-top: 12px;">
+        <div class="checkbox">
+          <input id="decompose" type="checkbox">
+          <label for="decompose" style="margin:0">decompose (multi-query)</label>
+        </div>
+        <div class="sub" style="margin: 4px 0 0; font-size: 12px;">
+          LLM разбивает составной вопрос на атомарные подвопросы.
+          Каждый ищется отдельно, кандидаты сливаются через RRF.
+        </div>
+      </div>
+
+      <div style="margin-top: 12px;">
+        <div class="checkbox">
+          <input id="rewrite" type="checkbox">
+          <label for="rewrite" style="margin:0">query rewrite</label>
+        </div>
+        <div class="sub" style="margin: 4px 0 0; font-size: 12px;">
+          LLM делает N разных формулировок ОДНОГО вопроса
+          (синонимы, технические термины, развёрнутая). Каждая ищется
+          отдельно, кандидаты сливаются через RRF.
+          Игнорируется если включён decompose.
+        </div>
+        <div style="margin-top: 8px;">
+          <div class="slider-row">
+            <label for="rewriteN" style="margin:0; font-size: 12px;">N формулировок</label>
+            <span class="val" id="rewriteNVal">3</span>
+          </div>
+          <input id="rewriteN" type="range" min="1" max="5" step="1" value="3">
+        </div>
+      </div>
+
+      <div style="margin-top: 12px;">
+        <div class="checkbox">
+          <input id="rerankPerSubq" type="checkbox">
+          <label for="rerankPerSubq" style="margin:0">per-subquery rerank</label>
+        </div>
+        <div class="sub" style="margin: 4px 0 0; font-size: 12px;">
+          rerank считается отдельно для каждого подвопроса.
+          Топ от каждого попадает в финал — сбалансированный набор
+          по всем аспектам запроса. Требует decompose + rerank.
+        </div>
+      </div>
+
+      <div style="margin-top: 12px;">
+        <div class="checkbox">
+          <input id="mmr" type="checkbox">
+          <label for="mmr" style="margin:0">mmr (diversification)</label>
+        </div>
+        <div class="sub" style="margin: 4px 0 0; font-size: 12px;">
+          финальный отбор top_k с балансом релевантности и разнообразия.
+          Помогает когда в топ забиваются дубликаты или соседние чанки.
+        </div>
+        <div style="margin-top: 8px;">
+          <div class="slider-row">
+            <label for="mmrLambda" style="margin:0; font-size: 12px;">λ — relevance ↔ diversity</label>
+            <span class="val" id="mmrLambdaVal">0.50</span>
+          </div>
+          <input id="mmrLambda" type="range" min="0" max="1" step="0.05" value="0.50">
+          <div class="sub" style="margin: 2px 0 0; font-size: 11px;">
+            1.0 = чистая релевантность (= MMR выключен). 0.0 = максимум разнообразия. 0.5 = баланс.
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top: 12px;">
+        <div class="slider-row">
+          <label for="minRerankScore" style="margin:0; font-size: 12px;">min rerank score (порог шума)</label>
+          <span class="val" id="minRerankScoreVal">0.00</span>
+        </div>
+        <input id="minRerankScore" type="range" min="0" max="1" step="0.01" value="0.00">
+        <div class="sub" style="margin: 2px 0 0; font-size: 11px;">
+          отрезает чанки с rrk ниже порога. 0 = выключен.
+          Работает только если включён rerank.
+        </div>
+      </div>
+
+      <div style="margin-top: 12px;">
+        <div class="checkbox">
+          <input id="expandContext" type="checkbox">
+          <label for="expandContext" style="margin:0">expand context (соседи)</label>
+        </div>
+        <div class="sub" style="margin: 4px 0 0; font-size: 12px;">
+          к каждому финальному чанку для промпта LLM добавляем соседей
+          по chunk_index. UI продолжает показывать «центры», а LLM
+          получает связный кусок документа.
+        </div>
+        <div style="margin-top: 8px;">
+          <div class="slider-row">
+            <label for="expandRadius" style="margin:0; font-size: 12px;">радиус (± чанков)</label>
+            <span class="val" id="expandRadiusVal">1</span>
+          </div>
+          <input id="expandRadius" type="range" min="1" max="3" step="1" value="1">
+        </div>
+      </div>
+
+      <div style="margin-top: 12px;">
         <div class="slider-row">
           <label for="minSim" style="margin:0">min similarity</label>
           <span class="val" id="minSimVal">0.50</span>
@@ -448,6 +627,18 @@
       </div>
     </div>
 
+    <!-- 1.5. ДЕКОМПОЗИЦИЯ — показывается только если включён checkbox -->
+    <div id="decomposePanel" class="panel" style="display: none;">
+      <h2>1.5. Декомпозиция запроса — LLM разбивает составной вопрос</h2>
+      <div id="decomposeContent"></div>
+    </div>
+
+    <!-- 1.6. REWRITE — показывается только если включён checkbox rewrite -->
+    <div id="rewritePanel" class="panel" style="display: none;">
+      <h2>1.6. Переформулировки запроса — LLM делает N версий одной темы</h2>
+      <div id="rewriteContent"></div>
+    </div>
+
     <!-- 2. RETRIEVAL — что нашли -->
     <div class="panel">
       <h2>2. Retrieval — что нашли в базе (top-K)</h2>
@@ -458,6 +649,7 @@
         <b style="color:#bb9af7">rrk</b> — cross-encoder reranker score (если включён).
         Стрелка <span style="color:var(--green)">#3 → #1</span> показывает как изменилась позиция после rerank.
       </div>
+      <div id="contextExpansionInfo"></div>
       <div id="chunks" class="chunks">
         <div class="sub">Здесь появятся найденные чанки и их similarity-score.</div>
       </div>
@@ -551,6 +743,35 @@ $("minSim").addEventListener("input", (e) => {
   $("minSimVal").textContent = Number(e.target.value).toFixed(2);
 });
 
+// Per-subquery rerank требует и decompose, и rerank. Чтобы не путать
+// пользователя — при включении автоматически активируем зависимости.
+$("rerankPerSubq").addEventListener("change", (e) => {
+  if (e.target.checked) {
+    $("decompose").checked = true;
+    $("rerank").checked = true;
+  }
+});
+
+// Слайдер λ для MMR — обновляем текущее значение рядом.
+$("mmrLambda").addEventListener("input", (e) => {
+  $("mmrLambdaVal").textContent = Number(e.target.value).toFixed(2);
+});
+
+// Слайдер порога reranker_score — обновляем значение рядом.
+$("minRerankScore").addEventListener("input", (e) => {
+  $("minRerankScoreVal").textContent = Number(e.target.value).toFixed(2);
+});
+
+// Радиус для expand_context — обновляем значение рядом.
+$("expandRadius").addEventListener("input", (e) => {
+  $("expandRadiusVal").textContent = String(e.target.value);
+});
+
+// Слайдер N для rewrite — обновляем значение рядом.
+$("rewriteN").addEventListener("input", (e) => {
+  $("rewriteNVal").textContent = String(e.target.value);
+});
+
 function setBusy(busy) {
   $("askBtn").disabled = busy;
   $("abortBtn").disabled = !busy;
@@ -583,15 +804,121 @@ function createEl(tag, attrs, ...children) {
   return el;
 }
 
+// Подсказки для бейджей в карточке чанка.
+const BADGE_TIPS = {
+  cos: "Cosine similarity между эмбеддингом запроса и эмбеддингом чанка (диапазон [-1, 1], обычно [0, 1]). В скобках — позиция чанка в vector-ranking.",
+  bm25: "ts_rank_cd из Postgres — BM25-подобная оценка совпадения слов запроса и чанка. В скобках — позиция в text-ranking. «—» если text-поиск не нашёл этот чанк.",
+  rrf: "Reciprocal Rank Fusion score = Σ 1/(60+rank_i) по vector и text спискам. Итоговая мера hybrid-поиска. Больше = чанк попал в оба списка ближе к началу.",
+  rrk: "Cross-encoder reranker score (bge-reranker-v2-m3): модель видит пару (query, chunk) целиком и выдаёт sigmoid-логит [0, 1]. Самая точная оценка релевантности.",
+};
+
 // Один мини-бейджик: cosine / bm25 rank / rrf. Если значения нет — серый «—».
 function badge(cls, label, valueText, present) {
+  const tip = BADGE_TIPS[cls];
+  const attrs = { class: "badge-mini " + cls + (present ? "" : " muted") };
+  if (tip) attrs["data-tip"] = tip;
   const badgeEl = createEl(
     "span",
-    { class: "badge-mini " + cls + (present ? "" : " muted") },
+    attrs,
     `${label}: `,
     createEl("b", null, valueText)
   );
   return badgeEl;
+}
+
+/*
+ * Блок переформулировок: показываем что вернул LLM-rewriter.
+ * Виден только если rewrite реально запускался (rewrite_status != "off").
+ *
+ * Если есть rewrite_groups с несколькими группами (combo decompose+rewrite),
+ * рисуем по группам: для каждого подвопроса свой список формулировок.
+ * Иначе плоский список.
+ */
+function renderRewrite(ex) {
+  const panel = $("rewritePanel");
+  const root = $("rewriteContent");
+  if (!panel || !root) return;
+  root.replaceChildren();
+
+  if (!ex.rewrite_ms || ex.rewrite_status === "off") {
+    panel.style.display = "none";
+    return;
+  }
+  panel.style.display = "";
+
+  root.appendChild(createEl(
+    "div", { class: "sub", style: "margin-bottom: 8px;" },
+    `LLM-rewriter отработал за ${ex.rewrite_ms.toFixed(0)} мс. ` +
+    `Всего сгенерировано ${ex.rewrites.length} формулировок, каждая прошла через hybrid_search, кандидаты слиты через RRF.`
+  ));
+
+  if (ex.rewrite_status === "failed") {
+    root.appendChild(createEl("div", { class: "warn" },
+      createEl("div", null,
+        "⚠ LLM-rewriter не справился хотя бы по одной группе. ",
+        "Для проблемных формулировок использован fallback на исходный запрос."
+      )
+    ));
+  }
+
+  const groups = ex.rewrite_groups || [];
+
+  // Случай 1: combo с decompose — групп несколько, каждая со своим подвопросом.
+  if (groups.length > 1) {
+    groups.forEach((g, gi) => {
+      const block = createEl("div", { style: "margin-top: 12px;" });
+      // Заголовок группы: оригинальный подвопрос.
+      block.appendChild(createEl(
+        "div", { class: "sub", style: "margin-bottom: 4px; color: var(--text);" },
+        createEl("b", null, `Подзапрос ${gi + 1}: `),
+        g.subquery
+      ));
+      const list = createEl("div", { class: "subq-list" });
+      g.rewrites.forEach((rw, i) => {
+        list.appendChild(createEl(
+          "div", { class: "subq-chip" },
+          createEl("span", { class: "num" }, `q${gi + 1}.${i + 1}`),
+          createEl("span", null, rw),
+        ));
+      });
+      block.appendChild(list);
+      root.appendChild(block);
+    });
+    return;
+  }
+
+  // Случай 2: одна группа — плоский список формулировок.
+  const flat = groups.length === 1 ? groups[0].rewrites : ex.rewrites;
+  if (!flat || flat.length <= 1) {
+    root.appendChild(createEl("div", { class: "subq-trivial" },
+      "LLM вернул только одну формулировку — расширения не произошло."
+    ));
+    return;
+  }
+  const list = createEl("div", { class: "subq-list" });
+  flat.forEach((rw, i) => {
+    list.appendChild(createEl(
+      "div", { class: "subq-chip" },
+      createEl("span", { class: "num" }, `q${i + 1}`),
+      createEl("span", null, rw),
+    ));
+  });
+  root.appendChild(list);
+}
+
+function renderContextExpansion(ex, chunksCount) {
+  // Тонкая полоса под заголовком блока Retrieval с информацией про
+  // расширение контекста. Если расширения не было — ничего не рисуем.
+  const root = $("contextExpansionInfo");
+  if (!root) return;
+  root.replaceChildren();
+  if (!ex || !ex.context_expanded || !ex.neighbors_added) return;
+  const centersText = chunksCount != null ? `${chunksCount}` : "финальным";
+  root.appendChild(createEl(
+    "div", { class: "sub", style: "margin: 4px 0 8px; color: var(--green);" },
+    `↺ К ${centersText} центральным чанкам подмешано ${ex.neighbors_added} соседей по chunk_index (радиус ±${ex.expand_radius}). ` +
+    "В UI показаны только центры — LLM получила расширенный текст с маркерами «[…контекст до…]» / «[…контекст после…]»."
+  ));
 }
 
 function renderChunks(chunks, mode = "hybrid") {
@@ -627,18 +954,25 @@ function renderChunks(chunks, mode = "hybrid") {
       primaryScore = Number(c.similarity).toFixed(4);
     }
 
-    // Стрелка-индикатор изменения позиции после rerank: #3 → #1 / #1 → #4.
+    // Стрелка-индикатор изменения позиции после rerank/MMR: #3 → #1.
+    // original_rank — позиция до reranker'а. mmr_rank — позиция после MMR.
+    // Если оба применялись, показываем «до reranker → после MMR» — это
+    // самая полезная сводка.
     const headLeftWrap = createEl("div", null, headLeft);
-    if (c.original_rank != null) {
+    if (c.original_rank != null || c.mmr_rank != null) {
       const newRank = i + 1;
-      const shift = c.original_rank - newRank;  // >0 = поднялся
+      const fromRank = c.original_rank != null ? c.original_rank : newRank;
+      const shift = fromRank - newRank;
       let shiftClass = "same";
-      let shiftText = `#${c.original_rank} → #${newRank}`;
+      const tooltip = c.mmr_rank != null
+        ? "Позиция изменилась после rerank и MMR-диверсификации"
+        : "Позиция изменилась после rerank'а";
+      const shiftText = `#${fromRank} → #${newRank}`;
       if (shift > 0) shiftClass = "up";
       else if (shift < 0) shiftClass = "down";
       const indicator = createEl(
         "span",
-        { class: "rank-shift " + shiftClass, title: shiftText },
+        { class: "rank-shift " + shiftClass, title: tooltip },
         shiftText
       );
       headLeftWrap.appendChild(indicator);
@@ -909,27 +1243,48 @@ function renderAllScores(all_scores, topChunks, threshold = 0) {
 function renderWarning(ex) {
   const box = $("warnBox");
   box.replaceChildren();
-  if (!ex.below_threshold) return;
 
-  const sim = ex.top_similarity != null
-    ? Number(ex.top_similarity).toFixed(4)
-    : "—";
-  const thr = Number(ex.min_similarity).toFixed(2);
+  // Может быть два независимых предупреждения подряд:
+  //   1. below_threshold — top-1 cosine ниже порога
+  //   2. filtered_by_threshold — rerank-фильтр отрезал чанки
 
-  const msg = createEl("div", { class: "warn" },
-    createEl("div", null,
-      "⚠ Слабый контекст: top-1 similarity = ",
-      createEl("b", null, sim),
-      " < порог ",
-      createEl("b", null, thr),
-      ". "
-    ),
-    createEl("div", { style: "margin-top: 4px;" },
-      "LLM всё равно сгенерирует ответ — но скорее всего из контекста релевантной информации нет. ",
-      "Проверь чанки выше и не доверяй ответу без верификации."
-    )
-  );
-  box.appendChild(msg);
+  if (ex.below_threshold) {
+    const sim = ex.top_similarity != null
+      ? Number(ex.top_similarity).toFixed(4)
+      : "—";
+    const thr = Number(ex.min_similarity).toFixed(2);
+
+    box.appendChild(createEl("div", { class: "warn" },
+      createEl("div", null,
+        "⚠ Слабый контекст: top-1 similarity = ",
+        createEl("b", null, sim),
+        " < порог ",
+        createEl("b", null, thr),
+        ". "
+      ),
+      createEl("div", { style: "margin-top: 4px;" },
+        "LLM всё равно сгенерирует ответ — но скорее всего из контекста релевантной информации нет. ",
+        "Проверь чанки выше и не доверяй ответу без верификации."
+      )
+    ));
+  }
+
+  if (ex.filtered_by_threshold > 0) {
+    box.appendChild(createEl("div", { class: "warn" },
+      createEl("div", null,
+        "⚠ Отфильтровано ",
+        createEl("b", null, String(ex.filtered_by_threshold)),
+        " чанков с reranker_score < ",
+        createEl("b", null, Number(ex.min_rerank_score).toFixed(2)),
+        "."
+      ),
+      createEl("div", { style: "margin-top: 4px;" },
+        "Cross-encoder посчитал эти чанки слабо релевантными твоему вопросу. ",
+        "Если в финале мало или совсем нет чанков — в корпусе нет ответа на одну из частей запроса. ",
+        "Загрузи соответствующий материал или понизь порог."
+      )
+    ));
+  }
 }
 
 // Очистка образовательных блоков перед новым запросом.
@@ -942,6 +1297,88 @@ function resetExplain() {
   );
   $("scoresList").replaceChildren();
   $("warnBox").replaceChildren();
+  $("decomposePanel").style.display = "none";
+  $("decomposeContent").replaceChildren();
+  const rwp = $("rewritePanel");
+  if (rwp) rwp.style.display = "none";
+  const rwc = $("rewriteContent");
+  if (rwc) rwc.replaceChildren();
+  const cei = $("contextExpansionInfo");
+  if (cei) cei.replaceChildren();
+}
+
+/*
+ * Блок декомпозиции: показываем что вернул LLM-декомпозитор.
+ * Виден только если хоть что-то делалось (decomposed=true или subqueries
+ * непустой и состоит из одного исходного — тогда сообщаем что разбор
+ * был но не понадобился).
+ */
+function renderDecompose(ex) {
+  const panel = $("decomposePanel");
+  const root = $("decomposeContent");
+  root.replaceChildren();
+
+  // Если декомпозиция вообще не запускалась — прячем блок.
+  if (ex.decompose_ms == null) {
+    panel.style.display = "none";
+    return;
+  }
+  panel.style.display = "";
+
+  // Метаинформация.
+  root.appendChild(createEl(
+    "div", { class: "sub", style: "margin-bottom: 8px;" },
+    `LLM-декомпозитор отработал за ${ex.decompose_ms.toFixed(0)} мс.`
+  ));
+
+  // Различаем три случая:
+  //   "decomposed" — реальный разбор на 2+ подзапросов.
+  //   "atomic"     — LLM явно вернул один подзапрос (запрос признан атомарным).
+  //   "failed"     — LLM вернул мусор/пустоту, парсер упал.
+  const status = ex.decompose_status || (ex.decomposed ? "decomposed" : "atomic");
+
+  if (status === "atomic") {
+    root.appendChild(createEl(
+      "div", { class: "subq-trivial" },
+      "LLM решил что запрос атомарный — multi-query поиск не запускался. "
+        + "Кандидаты получены обычным hybrid'ом."
+    ));
+    return;
+  }
+
+  if (status === "failed") {
+    // Жёлтая плашка: LLM не справился — используем исходный запрос как fallback.
+    root.appendChild(createEl(
+      "div", { class: "warn" },
+      createEl("div", null,
+        "⚠ LLM-декомпозитор не вернул валидный JSON-массив (вероятно пустой ответ — для reasoning-моделей это значит «не хватило бюджета токенов»). ",
+        "Использован fallback: запрос ушёл в hybrid_search как есть, без разбиения. ",
+        "Попробуй переформулировать запрос покороче или увеличить max_tokens в decomposer.py."
+      )
+    ));
+    return;
+  }
+
+  // Список чипов с подзапросами + индикатор режима reranking'а.
+  const modeNote =
+    ex.rerank_mode === "per_subquery"
+      ? " Reranking сделан ОТДЕЛЬНО для каждого подвопроса — топ каждого попал в финал."
+      : ex.rerank_mode === "global"
+      ? " Reranking сделан по ИСХОДНОМУ запросу поверх объединённых кандидатов."
+      : " Reranking выключен — финал отсортирован по RRF.";
+  root.appendChild(createEl("div", { class: "sub", style: "margin-bottom: 4px;" },
+    `Запрос разложен на ${ex.subqueries.length} подвопросов. Каждый прошёл через hybrid_search, кандидаты слиты через RRF.${modeNote}`
+  ));
+
+  const list = createEl("div", { class: "subq-list" });
+  ex.subqueries.forEach((sq, i) => {
+    list.appendChild(createEl(
+      "div", { class: "subq-chip" },
+      createEl("span", { class: "num" }, `q${i + 1}`),
+      createEl("span", null, sq),
+    ));
+  });
+  root.appendChild(list);
 }
 
 // --- Проверка здоровья сервера: показываем сколько чанков в БД ---
@@ -961,14 +1398,27 @@ async function pingHealth() {
 pingHealth();
 
 // --- Обычный (нестриминговый) запрос ---
-async function askNormal(query, topK, minSim, mode, rerank) {
+async function askNormal(query, opts) {
   const t0 = performance.now();
   activeAbort = new AbortController();
   const resp = await fetch("/api/ask", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      query, top_k: topK, min_similarity: minSim, search_mode: mode, rerank,
+      query,
+      top_k: opts.topK,
+      min_similarity: opts.minSim,
+      search_mode: opts.mode,
+      rerank: opts.rerank,
+      decompose: opts.decompose,
+      rerank_per_subquery: opts.rerankPerSubq,
+      mmr: opts.mmr,
+      mmr_lambda: opts.mmrLambda,
+      min_rerank_score: opts.minRerankScore,
+      expand_context: opts.expandContext,
+      expand_radius: opts.expandRadius,
+      rewrite: opts.rewrite,
+      rewrite_n: opts.rewriteN,
     }),
     signal: activeAbort.signal,
   });
@@ -981,6 +1431,9 @@ async function askNormal(query, topK, minSim, mode, rerank) {
   renderChunks(data.chunks, respMode);
   if (data.explain) {
     renderEmbedExplain(data.explain);
+    renderDecompose(data.explain);
+    renderRewrite(data.explain);
+    renderContextExpansion(data.explain, data.chunks.length);
     renderCosineExplain(data.explain);
     renderAllScores(data.explain.all_scores, data.chunks, data.explain.min_similarity);
     renderWarning(data.explain);
@@ -994,13 +1447,27 @@ async function askNormal(query, topK, minSim, mode, rerank) {
 }
 
 // --- Streaming-запрос через SSE ---
-function askStream(query, topK, minSim, mode, rerank) {
+function askStream(query, opts) {
   return new Promise((resolve, reject) => {
     const t0 = performance.now();
     // EventSource поддерживает только GET — поэтому параметры через query string.
-    const url = `/api/ask/stream?query=${encodeURIComponent(query)}`
-              + `&top_k=${topK}&min_similarity=${minSim}&search_mode=${mode}`
-              + `&rerank=${rerank ? "true" : "false"}`;
+    const params = new URLSearchParams({
+      query,
+      top_k: String(opts.topK),
+      min_similarity: String(opts.minSim),
+      search_mode: opts.mode,
+      rerank: String(opts.rerank),
+      decompose: String(opts.decompose),
+      rerank_per_subquery: String(opts.rerankPerSubq),
+      mmr: String(opts.mmr),
+      mmr_lambda: String(opts.mmrLambda),
+      min_rerank_score: String(opts.minRerankScore),
+      expand_context: String(opts.expandContext),
+      expand_radius: String(opts.expandRadius),
+      rewrite: String(opts.rewrite),
+      rewrite_n: String(opts.rewriteN),
+    });
+    const url = `/api/ask/stream?${params.toString()}`;
     const es = new EventSource(url);
     activeSource = es;
 
@@ -1018,6 +1485,9 @@ function askStream(query, topK, minSim, mode, rerank) {
       renderChunks(payload.chunks, m);
       if (payload.explain) {
         renderEmbedExplain(payload.explain);
+        renderDecompose(payload.explain);
+        renderRewrite(payload.explain);
+        renderContextExpansion(payload.explain, payload.chunks.length);
         renderCosineExplain(payload.explain);
         renderAllScores(payload.explain.all_scores, payload.chunks, payload.explain.min_similarity);
         renderWarning(payload.explain);
@@ -1064,6 +1534,15 @@ $("askBtn").addEventListener("click", async () => {
   const useStream = $("stream").checked;
   const mode = (document.querySelector('input[name="searchMode"]:checked') || {}).value || "hybrid";
   const rerank = $("rerank").checked;
+  const decompose = $("decompose").checked;
+  const rerankPerSubq = $("rerankPerSubq").checked;
+  const mmr = $("mmr").checked;
+  const mmrLambda = parseFloat($("mmrLambda").value) || 0.5;
+  const minRerankScore = parseFloat($("minRerankScore").value) || 0.0;
+  const expandContext = $("expandContext").checked;
+  const expandRadius = parseInt($("expandRadius").value, 10) || 1;
+  const rewrite = $("rewrite").checked;
+  const rewriteN = parseInt($("rewriteN").value, 10) || 3;
   if (!query) {
     showError("Введи вопрос.");
     return;
@@ -1077,11 +1556,17 @@ $("askBtn").addEventListener("click", async () => {
   $("promptDetails").open = false;
   resetExplain();
 
+  // Чтобы не плодить позиционные параметры — собираем опции в объект.
+  const opts = {
+    topK, minSim, mode, rerank, decompose, rerankPerSubq,
+    mmr, mmrLambda, minRerankScore, expandContext, expandRadius,
+    rewrite, rewriteN,
+  };
   try {
     if (useStream) {
-      await askStream(query, topK, minSim, mode, rerank);
+      await askStream(query, opts);
     } else {
-      await askNormal(query, topK, minSim, mode, rerank);
+      await askNormal(query, opts);
     }
     pingHealth();
   } catch (e) {
@@ -1117,13 +1602,60 @@ const HIGHER_IS_BETTER = new Set([
 // Метрики где «меньше = лучше»:
 const LOWER_IS_BETTER = new Set(["avg_latency_ms"]);
 
-// Отображаемые имена метрик и форматтеры.
+// Отображаемые имена метрик: [подпись, форматтер, человеческое объяснение].
+// Объяснения вешаем в data-tip атрибут на заголовки колонок —
+// при наведении показывается всплывашка (см. CSS-правила для [data-tip]).
 const METRIC_LABELS = {
-  hit_rate:        ["hit@k",     (v) => v.toFixed(3)],
-  recall_at_k:     ["recall@k",  (v) => v.toFixed(3)],
-  precision_at_k:  ["precision", (v) => v.toFixed(3)],
-  mrr:             ["MRR",       (v) => v.toFixed(3)],
-  avg_latency_ms:  ["ms/query",  (v) => v.toFixed(0)],
+  hit_rate: [
+    "hit@k",
+    (v) => v.toFixed(3),
+    "Hit Rate @ k — доля вопросов, где в top-K попался ХОТЯ БЫ ОДИН правильный чанк. 1.0 = система всегда что-то нашла; 0.5 = промахнулась на половине вопросов.",
+  ],
+  recall_at_k: [
+    "recall@k",
+    (v) => v.toFixed(3),
+    "Recall @ k — доля ВСЕХ правильных чанков, попавших в top-K. Если у вопроса 3 правильных и нашлось 2 — recall = 0.67. 1.0 = ни один правильный не пропущен.",
+  ],
+  precision_at_k: [
+    "precision",
+    (v) => v.toFixed(3),
+    "Precision @ k — доля правильных среди top-K. Если k=5 и из них 2 правильных, precision=0.4. У нас обычно мало правильных на вопрос, поэтому числа невысокие.",
+  ],
+  mrr: [
+    "MRR",
+    (v) => v.toFixed(3),
+    "Mean Reciprocal Rank — среднее 1/позиция_первого_правильного. Если правильный всегда на #1 → MRR=1.0. Если всегда на #2 → 0.5. Если не нашли → 0. Самая важная метрика «насколько хорошо ранжируем».",
+  ],
+  avg_latency_ms: [
+    "ms/query",
+    (v) => v.toFixed(0),
+    "Среднее время одного запроса в миллисекундах: эмбеддинг запроса + SQL-поиск (+ reranking если включён). Vector ~25 мс, hybrid ~25 мс, hybrid+rerank ~750 мс.",
+  ],
+};
+
+// Что значит каждый конфиг — подсказка для имени строки в сводной таблице.
+const CONFIG_TIPS = {
+  "vector": "Только cosine similarity между эмбеддингом запроса и эмбеддингами чанков. Хорош для перефразировок, плохо ловит редкие термины и аббревиатуры.",
+  "text": "Полнотекстовый BM25-подобный поиск через Postgres tsvector + GIN-индекс. Точные совпадения (ACID, GIL, HNSW) — идеально. Перефразировки — мимо.",
+  "hybrid": "Vector + text вместе. Каждый возвращает top-N кандидатов, потом склейка через Reciprocal Rank Fusion: rrf_score = Σ 1/(60+rank). Чанки которые оба видели всплывают в #1.",
+  "hybrid+rerank": "Hybrid отбирает top-15 кандидатов, потом cross-encoder bge-reranker-v2-m3 ставит финальный score на каждой паре (query, chunk). Медленно (~750 мс), но самая точная сортировка.",
+};
+
+// Что значит каждый тег вопроса в голден-сете.
+const TAG_TIPS = {
+  "python": "Вопрос про Python (file python_basics.md).",
+  "databases": "Вопрос про базы данных (file databases.md).",
+  "http": "Вопрос про HTTP-протокол (file http_protocol.md).",
+  "exact-term": "Запрос содержит конкретный термин из документа дословно. Здесь text-поиск часто лидирует.",
+  "abbreviation": "Аббревиатура (ACID, GIL, HNSW). Vector обычно теряется, text — выигрывает.",
+  "broad": "Широкий вопрос с несколькими подходящими чанками. Recall важнее precision.",
+  "comparison": "Вопрос на сравнение двух понятий (SQL vs NoSQL).",
+  "paraphrase": "Запрос переформулирован своими словами, не цитирует документ. Семантический поиск (vector, reranker) обычно лидирует.",
+  "narrow": "Узкий технический вопрос с конкретным ответом.",
+  "hard": "Сложный запрос: перефразировка + редкие слова. Главный тест для reranker'а.",
+  "cross-domain": "Вопрос смешивает темы из разных документов или из тем близких сущностей.",
+  "cross-language": "Запрос на другом языке от документа (например «Расскажи про index» при документах на русском).",
+  "out-of-corpus": "Вопрос про что-то, чего нет в корпусе напрямую. Тест на честность retrieval.",
 };
 
 function classifyValue(metric, value, allValues) {
@@ -1157,7 +1689,12 @@ function renderAggregates(aggregates) {
   const headRow = createEl("tr");
   headRow.appendChild(createEl("th", null, "config"));
   for (const m of Object.keys(METRIC_LABELS)) {
-    headRow.appendChild(createEl("th", null, METRIC_LABELS[m][0]));
+    const [label, , tip] = METRIC_LABELS[m];
+    const th = createEl("th", null);
+    // Сам label оборачиваем в span с data-tip — чтобы подчёркивание-точки
+    // показалось только на тексте, а не на пустой части ячейки.
+    th.appendChild(createEl("span", tip ? { "data-tip": tip } : null, label));
+    headRow.appendChild(th);
   }
   thead.appendChild(headRow);
   table.appendChild(thead);
@@ -1171,7 +1708,11 @@ function renderAggregates(aggregates) {
   const tbody = createEl("tbody");
   for (const cfg of configs) {
     const row = createEl("tr", { class: "row-name" });
-    row.appendChild(createEl("td", null, cfg));
+    // На имя конфига — подсказка про этот конфиг.
+    const nameCell = createEl("td", null);
+    const tip = CONFIG_TIPS[cfg];
+    nameCell.appendChild(createEl("span", tip ? { "data-tip": tip } : null, cfg));
+    row.appendChild(nameCell);
     for (const m of Object.keys(METRIC_LABELS)) {
       const value = aggregates[cfg][m];
       const cls = classifyValue(m, value, metricValues[m]);
@@ -1200,15 +1741,29 @@ function renderByTag(byTag, configNames) {
   const thead = createEl("thead");
   const headRow = createEl("tr");
   headRow.appendChild(createEl("th", null, "tag"));
-  headRow.appendChild(createEl("th", null, "n"));
-  for (const c of configNames) headRow.appendChild(createEl("th", null, c));
+  // На "n" вешаем подсказку — поясняем что это.
+  const thN = createEl("th", null);
+  thN.appendChild(createEl("span",
+    { "data-tip": "Сколько вопросов в голден-сете имеют этот тег. Если n маленькое — статистика для тега менее надёжная." },
+    "n"));
+  headRow.appendChild(thN);
+  for (const c of configNames) {
+    const th = createEl("th", null);
+    const tip = CONFIG_TIPS[c];
+    th.appendChild(createEl("span", tip ? { "data-tip": tip } : null, c));
+    headRow.appendChild(th);
+  }
   thead.appendChild(headRow);
   table.appendChild(thead);
 
   const tbody = createEl("tbody");
   for (const row of byTag) {
     const tr = createEl("tr");
-    tr.appendChild(createEl("td", null, row.tag));
+    // На имя тега — подсказка про этот тег.
+    const tagCell = createEl("td", null);
+    const tagTip = TAG_TIPS[row.tag];
+    tagCell.appendChild(createEl("span", tagTip ? { "data-tip": tagTip } : null, row.tag));
+    tr.appendChild(tagCell);
     tr.appendChild(createEl("td", null, String(row.n)));
     // Найдём лучший конфиг в этой строке по MRR.
     const vals = configNames.map((c) => (typeof row[c] === "number" ? row[c] : null));

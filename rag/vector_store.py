@@ -96,6 +96,10 @@ class RetrievedChunk:
     # Позиция чанка ДО reranking'а (1-based в списке, который пришёл от
     # hybrid/vector/text). Нужна UI чтобы показать «#3 → #1».
     original_rank: int | None = None
+    # --- Поля для MMR ---
+    # Позиция в MMR-отборе (1-based). None если MMR не применялся.
+    # Нужна чтобы показать в UI как MMR переставил порядок.
+    mmr_rank: int | None = None
 
 
 @dataclass(frozen=True)
@@ -455,6 +459,85 @@ class VectorStore:
         result.sort(key=lambda c: c.rrf_score or 0.0, reverse=True)
 
         return result[:top_k]
+
+    def get_embeddings(
+        self, keys: list[tuple[str, int]]
+    ) -> dict[tuple[str, int], list[float]]:
+        """
+        Батчевая загрузка эмбеддингов нескольких чанков.
+
+        Принимает список (source, chunk_index) и возвращает словарь
+        ключ → вектор. Используется для MMR — там нужны эмбеддинги
+        всех кандидатов одним запросом, чтобы считать попарную
+        cosine similarity.
+
+        Реализовано через ANY(...) с массивами — psycopg сам конвертирует
+        list of tuples. Один SQL вместо N запросов.
+        """
+        if not keys:
+            return {}
+        # Postgres не принимает напрямую массив кортежей в ANY,
+        # поэтому раскладываем на два параллельных массива.
+        sources = [k[0] for k in keys]
+        indices = [k[1] for k in keys]
+        sql = """
+            SELECT source, chunk_index, embedding
+            FROM chunks
+            WHERE (source, chunk_index) IN (
+                SELECT unnest(%s::text[]), unnest(%s::int[])
+            )
+        """
+        with self._conn.cursor() as cur:
+            cur.execute(sql, (sources, indices))
+            rows = cur.fetchall()
+        return {
+            (row[0], int(row[1])): list(row[2])
+            for row in rows
+        }
+
+    def get_neighbors(
+        self,
+        centers: list[tuple[str, int]],
+        radius: int = 1,
+    ) -> dict[tuple[str, int], str]:
+        """
+        Для каждого «центрального» чанка возвращает соседей в радиусе
+        `radius` чанков (по chunk_index). Используется для расширения
+        контекста при формировании промпта LLM: смысл часто разрывается
+        на границах чанков, а соседи восстанавливают связность.
+
+        Возвращает dict: (source, chunk_index) → content. Включает сами
+        центральные чанки тоже — это удобно при сборке итогового текста
+        (не надо отдельно их подтягивать).
+
+        Реализация — один SQL-запрос на всё. Для каждого центра считаем
+        диапазон [center-radius, center+radius] и берём все чанки этого
+        source с chunk_index в диапазоне.
+        """
+        if not centers:
+            return {}
+
+        # Группируем по source и складываем все нужные индексы.
+        # Дубликаты (если соседи разных центров совпадают) уберём естественно
+        # через UNION в SQL.
+        wanted: set[tuple[str, int]] = set()
+        for src, idx in centers:
+            for delta in range(-radius, radius + 1):
+                wanted.add((src, idx + delta))
+
+        sources = [k[0] for k in wanted]
+        indices = [k[1] for k in wanted]
+        sql = """
+            SELECT source, chunk_index, content
+            FROM chunks
+            WHERE (source, chunk_index) IN (
+                SELECT unnest(%s::text[]), unnest(%s::int[])
+            )
+        """
+        with self._conn.cursor() as cur:
+            cur.execute(sql, (sources, indices))
+            rows = cur.fetchall()
+        return {(row[0], int(row[1])): row[2] for row in rows}
 
     def get_embedding(self, source: str, chunk_index: int) -> list[float] | None:
         """

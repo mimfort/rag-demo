@@ -38,8 +38,11 @@ from pydantic import BaseModel, Field
 from rag.config import settings
 from rag.embedder import LMStudioEmbedder
 from rag.generator import LMStudioGenerator, build_user_prompt
+from rag.decomposer import QueryDecomposer
+from rag.mmr import mmr_select
 from rag.reranker import CrossEncoderReranker
-from rag.vector_store import RetrievedChunk, ScoredChunk, VectorStore
+from rag.rewriter import QueryRewriter
+from rag.vector_store import RetrievedChunk, ScoredChunk, VectorStore, RRF_K
 from evals.metrics import ChunkKey, QueryMetrics, aggregate, score_query
 from evals.runner import (
     GoldenItem,
@@ -60,6 +63,10 @@ SEARCH_MODES = ("vector", "text", "hybrid")
 # чем top_k — иначе кандидат, который изначально был на 12-м месте, никогда
 # не попадёт в финал, даже если он на самом деле лучший.
 RERANK_CANDIDATE_N = 15
+
+# Минимальный размер «пула» для MMR — чтобы было из чего выбирать
+# с учётом разнообразия. На маленьких пулах MMR не даёт эффекта.
+MMR_POOL_SIZE = 15
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +97,8 @@ _embedder: LMStudioEmbedder | None = None
 _store: VectorStore | None = None
 _generator: LMStudioGenerator | None = None
 _reranker: CrossEncoderReranker | None = None
+_decomposer: QueryDecomposer | None = None
+_rewriter: QueryRewriter | None = None
 
 
 @app.on_event("startup")
@@ -103,10 +112,14 @@ def _startup() -> None:
     в try/except: если что-то пошло не так, сервер всё равно стартует,
     просто rerank-параметр будет отдавать 503.
     """
-    global _embedder, _store, _generator, _reranker
+    global _embedder, _store, _generator, _reranker, _decomposer, _rewriter
     _embedder = LMStudioEmbedder()
     _store = VectorStore()
     _generator = LMStudioGenerator()
+    # Decomposer и Rewriter переиспользуют HTTP-клиент генератора (тот же
+    # endpoint /chat/completions). Стартуют мгновенно.
+    _decomposer = QueryDecomposer(_generator)
+    _rewriter = QueryRewriter(_generator)
     try:
         _reranker = CrossEncoderReranker()
     except Exception as exc:
@@ -146,6 +159,41 @@ class AskRequest(BaseModel):
     # Включить ли LLM-based reranking поверх retrieve-этапа. По умолчанию
     # выключен — он медленный (несколько секунд на запрос).
     rerank: bool = Field(default=False)
+    # Включить ли LLM-декомпозицию: вопрос → массив атомарных подзапросов.
+    # Для каждого подзапроса будет отдельный retrieve, кандидаты сольются
+    # через RRF. Полезно когда в одном запросе несколько разных тем.
+    decompose: bool = Field(default=False)
+    # Per-subquery rerank: rerank делается ОТДЕЛЬНО для каждого подзапроса,
+    # потом топы объединяются. Даёт сбалансированный top-K где представлены
+    # все темы запроса. Требует decompose=True (иначе игнорируется).
+    rerank_per_subquery: bool = Field(default=False)
+    # MMR (Maximal Marginal Relevance) — финальный шаг отбора, балансирует
+    # релевантность и разнообразие. Помогает когда top_k забивается
+    # дубликатами/соседними чанками.
+    mmr: bool = Field(default=False)
+    # Параметр λ для MMR ∈ [0, 1]. 1.0 = чистая релевантность,
+    # 0.0 = чистое разнообразие, 0.5 — баланс.
+    mmr_lambda: float = Field(default=0.5, ge=0.0, le=1.0)
+    # Порог reranker_score: чанки ниже этого значения отрезаются из финала.
+    # 0.0 = фильтр выключен. Применяется только если rerank=True (нужны
+    # reranker_score у чанков). Полезен на сложных запросах где система
+    # вынужденно подбирает «шум» под подзапросы без релевантного материала.
+    min_rerank_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    # Расширение контекста: к каждому финальному чанку для промпта LLM
+    # подмешиваем соседей по chunk_index. Помогает когда смысл разорван
+    # на границе чанков. В UI центральные чанки остаются прежними.
+    expand_context: bool = Field(default=False)
+    # Радиус расширения: 1 = по одному соседу с каждой стороны (±1),
+    # 2 = ±2, и т.д. Большие радиусы быстро раздувают промпт.
+    expand_radius: int = Field(default=1, ge=0, le=3)
+    # Query rewriting: LLM генерирует N формулировок одного вопроса
+    # (синонимы / технические термины / разная развёрнутость). Каждая
+    # отдельно идёт в hybrid_search, кандидаты сливаются через RRF.
+    # Расширяет «зону покрытия» в семантическом пространстве.
+    # Игнорируется если decompose=True (взаимоисключающие режимы).
+    rewrite: bool = Field(default=False)
+    # Сколько формулировок генерировать (включая исходную). 1 = no-op.
+    rewrite_n: int = Field(default=3, ge=1, le=5)
 
 
 class ChunkOut(BaseModel):
@@ -161,6 +209,8 @@ class ChunkOut(BaseModel):
     # Reranker-метрики (заполнены если rerank=True)
     reranker_score: float | None = None
     original_rank: int | None = None
+    # MMR-метрика — позиция чанка после диверсификации.
+    mmr_rank: int | None = None
 
 
 class ScoredOut(BaseModel):
@@ -198,6 +248,36 @@ class ExplainOut(BaseModel):
     # ── reranking-сводка ─────────────────────────────────────────────
     reranked: bool
     rerank_ms: float | None = None  # сколько времени заняло (в мс), если делалось
+    # Режим reranking'а: "off" | "global" | "per_subquery".
+    # "global"        — один rerank по исходному запросу (классика).
+    # "per_subquery"  — rerank на каждом подзапросе отдельно, потом объединение.
+    rerank_mode: str = "off"
+    # ── MMR-сводка ─────────────────────────────────────────────────
+    mmr_applied: bool = False
+    mmr_lambda: float | None = None
+    mmr_candidates: int | None = None  # сколько чанков было до MMR-обрезки
+    # ── threshold-фильтр по reranker_score ─────────────────────────
+    min_rerank_score: float = 0.0
+    # Сколько чанков отрезано фильтром (информация для UI/предупреждения).
+    filtered_by_threshold: int = 0
+    # ── расширение контекста соседями ──────────────────────────────
+    context_expanded: bool = False
+    expand_radius: int | None = None
+    neighbors_added: int = 0  # сколько уникальных соседних чанков подмешано
+    # ── query rewriting ────────────────────────────────────────────
+    rewritten: bool = False             # реально ли сгенерировали >1 формулировку
+    rewrite_status: str = "off"         # "off" | "rewritten" | "failed"
+    rewrites: list[str] = []            # все формулировки (flat, для retrieval)
+    rewrite_ms: float | None = None     # суммарное время LLM-вызовов
+    # Группировка: если был decompose, для каждого подвопроса свои rewrites.
+    # Каждая запись: {"subquery": str, "rewrites": list[str]}.
+    # Если decompose выключен — одна группа c subquery=исходный_запрос.
+    rewrite_groups: list[dict] = []
+    # ── декомпозиция ─────────────────────────────────────────────────
+    decomposed: bool                  # делался ли реальный разбор (status="decomposed")
+    decompose_status: str = "off"     # "off" | "decomposed" | "atomic" | "failed"
+    subqueries: list[str] = []        # что вернул декомпозитор (минимум — [query])
+    decompose_ms: float | None = None # время на LLM-вызов
 
 
 class AskResponse(BaseModel):
@@ -221,6 +301,7 @@ def _to_chunk_out(chunks: list[RetrievedChunk]) -> list[ChunkOut]:
             rrf_score=c.rrf_score,
             reranker_score=c.reranker_score,
             original_rank=c.original_rank,
+            mmr_rank=c.mmr_rank,
         )
         for c in chunks
     ]
@@ -231,13 +312,191 @@ def _to_chunk_out(chunks: list[RetrievedChunk]) -> list[ChunkOut]:
 PREVIEW_DIMS = 64
 
 
+def _multi_query_per_subq_rerank(
+    subqueries: list[str],
+    top_k: int,
+    candidate_per_subq: int = 15,
+) -> list[RetrievedChunk]:
+    """
+    Per-subquery rerank: для КАЖДОГО подзапроса делаем
+        hybrid_search → rerank по ЭТОМУ подзапросу → top-N_per_subq
+    Потом объединяем все top'ы, дедуплицируем по (source, chunk_index),
+    обрезаем до top_k.
+
+    Главное отличие от обычного rerank:
+      - Reranker считает score по СВОЕМУ подвопросу, не по общему запросу.
+      - Поэтому чанк который отвечает только на одну часть может получить
+        высокий score (он действительно отвечает на свой подвопрос) и
+        попасть в финал. В «глобальном» rerank такой чанк проигрывал бы
+        более «универсальным» кандидатам.
+
+    Стратегия объединения: первая встреча чанка с лучшим rerank-score
+    выигрывает. Если чанк попал в top'ы нескольких подзапросов, его
+    показываем один раз с самым высоким score.
+    """
+    assert _embedder is not None and _store is not None and _reranker is not None
+    from dataclasses import replace
+
+    # Сколько брать от каждого подвопроса. Гарантируем минимум 2,
+    # чтобы при 5 подзапросах и top_k=5 не получить 5 чанков по 1 от каждого
+    # без запаса на дедуп.
+    per_subq_take = max(2, top_k // max(1, len(subqueries)) + 1)
+
+    best_by_key: dict[tuple[str, int], RetrievedChunk] = {}
+
+    for subq in subqueries:
+        subq_vec = _embedder.embed_one(subq)
+        cand = _store.hybrid_search(
+            subq, subq_vec,
+            top_k=candidate_per_subq,
+            candidate_n=20,
+        )
+        # Reranker по ЭТОМУ подзапросу.
+        ranked = _reranker.rerank(subq, cand, top_k=per_subq_take)
+
+        for c in ranked:
+            key = (c.source, c.chunk_index)
+            existing = best_by_key.get(key)
+            # Keep the best score across subqueries. reranker_score
+            # сопоставим между подзапросами (sigmoid у нашего bge-reranker).
+            if existing is None or (
+                (c.reranker_score or 0.0) > (existing.reranker_score or 0.0)
+            ):
+                best_by_key[key] = c
+
+    # Сортируем итоговый набор по reranker_score, обрезаем до top_k.
+    result = list(best_by_key.values())
+    result.sort(key=lambda c: c.reranker_score or 0.0, reverse=True)
+    return result[:top_k]
+
+
+def _multi_query_hybrid(
+    subqueries: list[str],
+    top_k: int,
+    candidate_per_subq: int,
+) -> list[RetrievedChunk]:
+    """
+    Запускает hybrid_search для каждого подзапроса и сливает результаты
+    через RRF по ключу (source, chunk_index).
+
+    Идея та же что в одиночном hybrid'е — комбинируем по рангам, без
+    масштабирования скоров. Только теперь списков не 2 (vector + text),
+    а 2 × N (по два списка от каждого подзапроса, но через hybrid_search
+    они уже склеены).
+
+    candidate_per_subq — сколько кандидатов брать у каждого подзапроса.
+    Должно быть больше top_k, чтобы хорошие кандидаты из разных подзапросов
+    встречались в финале.
+    """
+    assert _embedder is not None and _store is not None
+    from collections import defaultdict
+    from dataclasses import replace
+
+    by_key: dict[tuple[str, int], RetrievedChunk] = {}
+    rrf_scores: dict[tuple[str, int], float] = defaultdict(float)
+
+    for subq in subqueries:
+        subq_vec = _embedder.embed_one(subq)
+        hits = _store.hybrid_search(
+            subq, subq_vec,
+            top_k=candidate_per_subq,
+            candidate_n=20,
+        )
+        for rank, hit in enumerate(hits, start=1):
+            key = (hit.source, hit.chunk_index)
+            # Кладём первый встретившийся вариант чанка (с его метаданными
+            # rank'ов от первого подзапроса где он попал). RRF выше всё
+            # равно сложит вклады правильно.
+            if key not in by_key:
+                by_key[key] = hit
+            rrf_scores[key] += 1.0 / (RRF_K + rank)
+
+    # Прописываем итоговый rrf_score, сортируем, обрезаем до top_k.
+    result: list[RetrievedChunk] = []
+    for key, hit in by_key.items():
+        result.append(replace(hit, rrf_score=rrf_scores[key]))
+    result.sort(key=lambda c: c.rrf_score or 0.0, reverse=True)
+    return result[:top_k]
+
+
+def _expand_chunks_with_neighbors(
+    chunks: list[RetrievedChunk],
+    radius: int,
+) -> tuple[list[RetrievedChunk], int]:
+    """
+    Возвращает (расширенные_чанки_для_промпта, сколько_соседей_добавлено).
+
+    Идея: оригинальные «центральные» чанки оставляем как есть в UI и для
+    ранжирования, но для текста промпта в LLM каждому чанку дописываем
+    соседей до радиуса. Получается связный кусок документа вокруг попавшего
+    в финал фрагмента.
+
+    Соседи помечаются текстовыми разделителями `[…контекст до…]` и
+    `[…контекст после…]` — LLM понимает что это окружение, а не сам
+    центральный фрагмент.
+
+    Дубли уникализируем по (source, chunk_index): если у двух центральных
+    чанков общий сосед, он войдёт только в один (более ранний). Сам центр
+    тоже не дублируется в собственном «контексте» соседа.
+    """
+    assert _store is not None
+    if radius <= 0 or not chunks:
+        return chunks, 0
+
+    centers = [(c.source, c.chunk_index) for c in chunks]
+    pool = _store.get_neighbors(centers, radius=radius)
+
+    # Считаем сколько НОВЫХ чанков мы притащили (соседей сверх центров).
+    center_set = set(centers)
+    neighbor_keys = set(pool.keys()) - center_set
+    neighbors_added = len(neighbor_keys)
+
+    # Чтобы один и тот же сосед не «прирос» дважды (если он сосед сразу
+    # двум центральным), помечаем чанки которые уже использованы как
+    # contextual neighbours.
+    consumed: set[tuple[str, int]] = set()
+
+    from dataclasses import replace
+    enriched: list[RetrievedChunk] = []
+    for c in chunks:
+        parts: list[str] = []
+        # Префиксные соседи (chunk_index - radius .. chunk_index - 1).
+        for d in range(radius, 0, -1):
+            key = (c.source, c.chunk_index - d)
+            if key in pool and key not in consumed and key not in center_set:
+                parts.append(f"[…контекст до…]\n{pool[key]}")
+                consumed.add(key)
+        # Сам центр.
+        parts.append(c.content)
+        # Постфиксные соседи.
+        for d in range(1, radius + 1):
+            key = (c.source, c.chunk_index + d)
+            if key in pool and key not in consumed and key not in center_set:
+                parts.append(f"[…контекст после…]\n{pool[key]}")
+                consumed.add(key)
+
+        enriched_text = "\n\n".join(parts)
+        enriched.append(replace(c, content=enriched_text))
+
+    return enriched, neighbors_added
+
+
 def _retrieve_with_explain(
     query: str,
     top_k: int,
     min_similarity: float = 0.0,
     search_mode: str = "hybrid",
     rerank: bool = False,
-) -> tuple[list[RetrievedChunk], ExplainOut]:
+    decompose: bool = False,
+    rerank_per_subquery: bool = False,
+    mmr: bool = False,
+    mmr_lambda: float = 0.5,
+    min_rerank_score: float = 0.0,
+    expand_context: bool = False,
+    expand_radius: int = 1,
+    rewrite: bool = False,
+    rewrite_n: int = 3,
+) -> tuple[list[RetrievedChunk], list[RetrievedChunk], ExplainOut]:
     """
     Делает весь retrieval-цикл и собирает образовательный отчёт.
 
@@ -257,18 +516,131 @@ def _retrieve_with_explain(
             detail=f"search_mode должен быть одним из {SEARCH_MODES}",
         )
 
-    # 1. Эмбеддинг запроса считаем всегда — для образовательных панелей.
+    # 1. Эмбеддинг ИСХОДНОГО запроса — всегда. Используется в:
+    #    - образовательной панели (heatmap, норма, превью);
+    #    - гистограмме «similarity по всей базе» (она показывает близость
+    #      базы к исходному вопросу, не к подзапросам);
+    #    - single-query retrieval, если decompose выключен.
     t0 = time.perf_counter()
     query_vec = _embedder.embed_one(query)
     embed_ms = (time.perf_counter() - t0) * 1000.0
+
+    # 1.5. Декомпозиция запроса (опционально). Если выключено —
+    #      subqueries состоит из одного элемента (исходный query),
+    #      и дальше всё работает как раньше.
+    subqueries: list[str] = [query]
+    decompose_ms: float | None = None
+    decompose_status = "off"  # "off" | "decomposed" | "atomic" | "failed"
+    if decompose:
+        if _decomposer is None:
+            raise HTTPException(503, "Decomposer не инициализирован")
+        t_dec = time.perf_counter()
+        result = _decomposer.decompose(query)
+        subqueries = result.subqueries
+        decompose_status = result.status
+        decompose_ms = round((time.perf_counter() - t_dec) * 1000.0, 1)
+
+    # 1.6. Query rewriting (опционально). Работает И поверх decompose:
+    #      если декомпозитор разбил вопрос на subqueries, для КАЖДОГО
+    #      делаем свой rewrite (N формулировок). Результат — flat-список
+    #      ВСЕХ формулировок ВСЕХ подвопросов.
+    #
+    #      Зачем combo: decompose работает на уровне «тем» (разные сущности),
+    #      rewrite — на уровне «лексики одной темы» (синонимы/термины).
+    #      Вместе дают максимальное покрытие.
+    rewrites: list[str] = [query]
+    rewrite_groups: list[dict] = []
+    rewrite_ms: float | None = None
+    rewrite_status = "off"  # "off" | "rewritten" | "failed"
+    rewrite_active = rewrite
+    if rewrite_active:
+        if _rewriter is None:
+            raise HTTPException(503, "Rewriter не инициализирован")
+        # База для rewrite: либо подвопросы (если decompose сработал),
+        # либо исходный запрос (один элемент).
+        base_queries = (
+            subqueries if decompose_status == "decomposed" else [query]
+        )
+        all_rewrites: list[str] = []
+        any_real_rewrite = False
+        any_failed = False
+        t_rw = time.perf_counter()
+        for sq in base_queries:
+            rw_result = _rewriter.rewrite(sq, n=rewrite_n)
+            rewrite_groups.append({
+                "subquery": sq,
+                "rewrites": rw_result.rewrites,
+                "status": rw_result.status,
+            })
+            all_rewrites.extend(rw_result.rewrites)
+            if rw_result.status == "rewritten" and len(rw_result.rewrites) > 1:
+                any_real_rewrite = True
+            if rw_result.status == "failed":
+                any_failed = True
+        rewrite_ms = round((time.perf_counter() - t_rw) * 1000.0, 1)
+        rewrites = all_rewrites
+        if any_real_rewrite:
+            rewrite_status = "rewritten"
+        elif any_failed:
+            rewrite_status = "failed"
+        else:
+            # Все группы вернули по одной формулировке — фактически no-op.
+            rewrite_status = "rewritten"
 
     # 2. Поиск в выбранном режиме.
     #    Когда включён rerank, нам нужно МНОГО кандидатов (RERANK_CANDIDATE_N),
     #    чтобы reranker имел из чего выбирать. Иначе хороший чанк, который
     #    изначально оказался на 12-м месте, никогда не попадёт в top_k.
-    fetch_n = RERANK_CANDIDATE_N if rerank else top_k
+    #    Когда включён MMR, тоже нужен запас — иначе MMR-отбор не сможет
+    #    «играть» с разнообразием.
+    pool_size = max(MMR_POOL_SIZE if mmr else 0, top_k)
+    fetch_n = max(RERANK_CANDIDATE_N if rerank else 0, pool_size)
 
-    if search_mode == "vector":
+    # Per-subquery rerank требует и decompose, и rerank, и реальной декомпозиции.
+    # Если эти условия не выполнены — режим сам по себе деградирует в global rerank
+    # (или совсем выключается).
+    is_per_subq = (
+        rerank_per_subquery
+        and rerank
+        and decompose
+        and len(subqueries) > 1
+    )
+
+    # Multi-query путь: если LLM реально разложил запрос на несколько подзапросов,
+    # принудительно используем hybrid-стратегию по каждому из них и сливаем
+    # через RRF. Режимы vector/text по отдельности не используем — multi-query
+    # уже включает оба слоя hybrid'а.
+    rerank_ms_inline: float | None = None
+    if is_per_subq:
+        # Этот пайплайн САМ делает rerank внутри (на каждом подвопросе),
+        # поэтому ниже глобальный rerank не нужен. Берём pool_size кандидатов
+        # чтобы оставить запас для MMR (если он тоже включён).
+        if _reranker is None:
+            raise HTTPException(503, "Reranker не инициализирован")
+        t_rr = time.perf_counter()
+        chunks = _multi_query_per_subq_rerank(
+            subqueries,
+            top_k=pool_size,
+            candidate_per_subq=RERANK_CANDIDATE_N,
+        )
+        rerank_ms_inline = round((time.perf_counter() - t_rr) * 1000.0, 1)
+    elif rewrite_active and len(rewrites) > 1:
+        # Rewrite приоритет над «голым» decompose: rewrites уже содержат
+        # все формулировки всех подвопросов (если decompose=True), или
+        # формулировки исходного запроса (если decompose=False).
+        # Объединение через RRF.
+        chunks = _multi_query_hybrid(
+            rewrites,
+            top_k=fetch_n,
+            candidate_per_subq=max(fetch_n, 10),
+        )
+    elif decompose and len(subqueries) > 1:
+        chunks = _multi_query_hybrid(
+            subqueries,
+            top_k=fetch_n,
+            candidate_per_subq=max(fetch_n, 10),
+        )
+    elif search_mode == "vector":
         chunks = _store.search(query_vec, top_k=fetch_n, include_embeddings=True)
     elif search_mode == "text":
         text_hits = _store.text_search(query, top_n=fetch_n)
@@ -288,25 +660,87 @@ def _retrieve_with_explain(
             query, query_vec, top_k=fetch_n, candidate_n=20
         )
 
-    # 2.5. Reranking — опционально. После него у каждого чанка появляется
-    #      reranker_score и original_rank (позиция до rerank). Сортировка
-    #      по reranker_score. Обрезаем до top_k.
+    # 2.5. Reranking — опционально. Три случая:
+    #   (а) is_per_subq — rerank уже сделан внутри _multi_query_per_subq_rerank,
+    #       просто фиксируем mode и ms.
+    #   (б) rerank=True (но не per-subq) — классический «глобальный» rerank
+    #       по исходному запросу поверх объединённых кандидатов.
+    #   (в) rerank=False — обрезаем результат до top_k и идём дальше.
     rerank_ms: float | None = None
     actually_reranked = False
-    if rerank and chunks:
+    rerank_mode = "off"
+
+    if is_per_subq:
+        rerank_ms = rerank_ms_inline
+        actually_reranked = True
+        rerank_mode = "per_subquery"
+    elif rerank and chunks:
         if _reranker is None:
             raise HTTPException(
                 status_code=503,
                 detail="Reranker не инициализирован (модель ещё не скачана?)",
             )
         t_rr = time.perf_counter()
-        chunks = _reranker.rerank(query, chunks, top_k=top_k)
+        # Если MMR включён — reranker оставляет pool_size кандидатов,
+        # финальную обрезку до top_k делает MMR.
+        chunks = _reranker.rerank(query, chunks, top_k=pool_size)
         rerank_ms = round((time.perf_counter() - t_rr) * 1000.0, 1)
         actually_reranked = True
+        rerank_mode = "global"
     elif not rerank:
-        # rerank выключен — обрезаем сами до top_k (выше брали fetch_n=top_k,
-        # но если когда-нибудь поменяем логику — этот срез лишним не будет).
+        # rerank выключен — обрезаем до pool_size (= top_k если MMR off,
+        # иначе MMR_POOL_SIZE). Финальная обрезка до top_k — ниже.
+        chunks = chunks[:pool_size]
+
+    # 2.6. MMR — Maximal Marginal Relevance. Финальный отбор с балансом
+    #      «релевантность ↔ разнообразие». Применяется ПОСЛЕ всех остальных
+    #      слоёв (hybrid, rerank, per-subq). Берёт текущий pool кандидатов
+    #      и обрезает до top_k с учётом diversity.
+    mmr_applied = False
+    mmr_candidates_n: int | None = None
+    if mmr and len(chunks) > 1:
+        # Подгружаем эмбеддинги всех кандидатов одним SQL — нужны для
+        # попарных cosine similarity в MMR-формуле.
+        keys = [(c.source, c.chunk_index) for c in chunks]
+        embeddings_map = _store.get_embeddings(keys)
+        mmr_candidates_n = len(chunks)
+        chunks = mmr_select(
+            chunks,
+            embeddings=embeddings_map,
+            top_k=top_k,
+            lambda_=mmr_lambda,
+        )
+        mmr_applied = True
+    else:
+        # MMR не применяем — но всё равно обрезаем до top_k
+        # (выше могли взять pool_size > top_k для запаса).
         chunks = chunks[:top_k]
+
+    # 2.7. Threshold-фильтр по reranker_score.
+    #      Применяется ТОЛЬКО если был rerank — иначе нечего фильтровать
+    #      (reranker_score у чанков отсутствует). Отрезает чанки с
+    #      reranker_score ниже порога — это «явный шум», подобранный
+    #      под подзапросы без релевантного материала.
+    filtered_count = 0
+    if actually_reranked and min_rerank_score > 0.0:
+        before = len(chunks)
+        chunks = [
+            c for c in chunks
+            if (c.reranker_score or 0.0) >= min_rerank_score
+        ]
+        filtered_count = before - len(chunks)
+
+    # 2.8. Context expansion: к каждому центральному чанку для промпта
+    #      LLM подмешиваем соседей. UI продолжает видеть «центры», а
+    #      сгенерированный prompt использует расширенные тексты.
+    chunks_for_prompt = chunks
+    neighbors_added = 0
+    context_expanded = False
+    if expand_context and chunks and expand_radius > 0:
+        chunks_for_prompt, neighbors_added = _expand_chunks_with_neighbors(
+            chunks, radius=expand_radius,
+        )
+        context_expanded = neighbors_added > 0
 
     # 3. Similarity для ВСЕХ чанков базы — для гистограммы в UI.
     #    Не зависит от search_mode: гистограмма всегда показывает cosine,
@@ -362,8 +796,26 @@ def _retrieve_with_explain(
         search_mode=search_mode,
         reranked=actually_reranked,
         rerank_ms=rerank_ms,
+        rerank_mode=rerank_mode,
+        decomposed=decompose_status == "decomposed",
+        decompose_status=decompose_status,
+        subqueries=subqueries,
+        decompose_ms=decompose_ms,
+        mmr_applied=mmr_applied,
+        mmr_lambda=mmr_lambda if mmr_applied else None,
+        mmr_candidates=mmr_candidates_n,
+        min_rerank_score=min_rerank_score,
+        filtered_by_threshold=filtered_count,
+        context_expanded=context_expanded,
+        expand_radius=expand_radius if expand_context else None,
+        neighbors_added=neighbors_added,
+        rewritten=rewrite_status == "rewritten" and len(rewrites) > 1,
+        rewrite_status=rewrite_status,
+        rewrites=rewrites,
+        rewrite_ms=rewrite_ms,
+        rewrite_groups=rewrite_groups,
     )
-    return chunks, explain
+    return chunks, chunks_for_prompt, explain
 
 
 # ---------------------------------------------------------------------------
@@ -379,16 +831,23 @@ def ask(req: AskRequest) -> AskResponse:
     """Обычный (нестриминговый) RAG-запрос."""
     assert _generator is not None  # для тайп-чекера
 
-    chunks, explain = _retrieve_with_explain(
-        req.query, req.top_k, req.min_similarity, req.search_mode, req.rerank,
+    chunks, chunks_for_prompt, explain = _retrieve_with_explain(
+        req.query, req.top_k, req.min_similarity, req.search_mode,
+        req.rerank, req.decompose, req.rerank_per_subquery,
+        req.mmr, req.mmr_lambda, req.min_rerank_score,
+        req.expand_context, req.expand_radius,
+        req.rewrite, req.rewrite_n,
     )
     if not chunks:
         raise HTTPException(
             status_code=400,
             detail="В базе нет чанков. Запусти `python ingest.py`.",
         )
-    prompt = build_user_prompt(req.query, chunks)
-    answer = _generator.generate(req.query, chunks)
+    # Промпт и ответ строим на расширенных чанках (с соседями, если был
+    # expand_context). В UI отдаём оригинальные «центральные» чанки —
+    # пользователь видит что именно retrieval нашёл, без раздувания.
+    prompt = build_user_prompt(req.query, chunks_for_prompt)
+    answer = _generator.generate(req.query, chunks_for_prompt)
     return AskResponse(
         chunks=_to_chunk_out(chunks),
         prompt=prompt,
@@ -422,6 +881,15 @@ def ask_stream(
     min_similarity: float = 0.0,
     search_mode: str = "hybrid",
     rerank: bool = False,
+    decompose: bool = False,
+    rerank_per_subquery: bool = False,
+    mmr: bool = False,
+    mmr_lambda: float = 0.5,
+    min_rerank_score: float = 0.0,
+    expand_context: bool = False,
+    expand_radius: int = 1,
+    rewrite: bool = False,
+    rewrite_n: int = 3,
 ) -> StreamingResponse:
     """
     Streaming-версия. Шлёт три типа событий:
@@ -436,17 +904,23 @@ def ask_stream(
     if not query.strip():
         raise HTTPException(status_code=400, detail="query пуст")
 
-    chunks, explain = _retrieve_with_explain(
-        query, top_k, min_similarity, search_mode, rerank,
+    chunks, chunks_for_prompt, explain = _retrieve_with_explain(
+        query, top_k, min_similarity, search_mode,
+        rerank, decompose, rerank_per_subquery,
+        mmr, mmr_lambda, min_rerank_score,
+        expand_context, expand_radius,
+        rewrite, rewrite_n,
     )
 
     def event_source() -> Iterator[str]:
         # 1. Сначала отдаём «meta»: что нашли, промпт и explain-блок.
         #    Используем _to_chunk_out (тот же, что в POST /api/ask) — иначе
         #    легко забыть какое-нибудь поле когда схема расширяется.
+        #    В UI отдаём оригинальные центральные чанки, а в промпт —
+        #    расширенные соседями (если включён expand_context).
         meta_payload = {
             "chunks": [c.model_dump() for c in _to_chunk_out(chunks)],
-            "prompt": build_user_prompt(query, chunks),
+            "prompt": build_user_prompt(query, chunks_for_prompt),
             # Pydantic.model_dump() даёт обычный dict — его легко уложить в JSON.
             "explain": explain.model_dump(),
         }
@@ -461,8 +935,8 @@ def ask_stream(
             yield _sse_event("done", {})
             return
 
-        # 2. Стримим токены ответа.
-        for piece in _generator.generate_stream(query, chunks):
+        # 2. Стримим токены ответа. LLM получает расширенный контекст.
+        for piece in _generator.generate_stream(query, chunks_for_prompt):
             yield _sse_event("token", {"text": piece})
 
         # 3. Сигнал конца.
