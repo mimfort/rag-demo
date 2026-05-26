@@ -1,0 +1,256 @@
+[
+  {
+    "id": "q01",
+    "question": "Что такое GIL в Python?",
+    "tags": ["python", "exact-term"],
+    "relevant": [
+      {"source": "python_basics.md", "chunk_index": 5}
+    ]
+  },
+  {
+    "id": "q02",
+    "question": "Объясни свойства ACID",
+    "tags": ["databases", "exact-term", "abbreviation"],
+    "relevant": [
+      {"source": "databases.md", "chunk_index": 6}
+    ]
+  },
+  {
+    "id": "q03",
+    "question": "Какие методы HTTP бывают?",
+    "tags": ["http", "broad"],
+    "relevant": [
+      {"source": "http_protocol.md", "chunk_index": 1}
+    ]
+  },
+  {
+    "id": "q04",
+    "question": "Чем отличается SQL от NoSQL?",
+    "tags": ["databases", "comparison"],
+    "relevant": [
+      {"source": "databases.md", "chunk_index": 8},
+      {"source": "databases.md", "chunk_index": 9},
+      {"source": "databases.md", "chunk_index": 10}
+    ]
+  },
+  {
+    "id": "q05",
+    "question": "Что такое REST?",
+    "tags": ["http", "exact-term"],
+    "relevant": [
+      {"source": "http_protocol.md", "chunk_index": 6}
+    ]
+  },
+  {
+    "id": "q06",
+    "question": "Зачем нужны индексы в базе данных?",
+    "tags": ["databases", "paraphrase"],
+    "relevant": [
+      {"source": "databases.md", "chunk_index": 3},
+      {"source": "databases.md", "chunk_index": 4},
+      {"source": "databases.md", "chunk_index": 5}
+    ]
+  },
+  {
+    "id": "q07",
+    "question": "Что такое HTTPS?",
+    "tags": ["http", "exact-term"],
+    "relevant": [
+      {"source": "http_protocol.md", "chunk_index": 5}
+    ]
+  },
+  {
+    "id": "q08",
+    "question": "Что такое менеджер контекста with в Python?",
+    "tags": ["python", "paraphrase"],
+    "relevant": [
+      {"source": "python_basics.md", "chunk_index": 3}
+    ]
+  },
+  {
+    "id": "q09",
+    "question": "Для чего нужен venv?",
+    "tags": ["python", "exact-term"],
+    "relevant": [
+      {"source": "python_basics.md", "chunk_index": 4}
+    ]
+  },
+  {
+    "id": "q10",
+    "question": "Расскажи про WebSocket",
+    "tags": ["http", "exact-term"],
+    "relevant": [
+      {"source": "http_protocol.md", "chunk_index": 7}
+    ]
+  },
+  {
+    "id": "q11",
+    "question": "Какие уровни изоляции транзакций бывают?",
+    "tags": ["databases", "narrow"],
+    "relevant": [
+      {"source": "databases.md", "chunk_index": 7}
+    ]
+  },
+  {
+    "id": "q12",
+    "question": "Что такое словарь в Python?",
+    "tags": ["python", "broad"],
+    "relevant": [
+      {"source": "python_basics.md", "chunk_index": 2}
+    ]
+  },
+  {
+    "id": "q13",
+    "question": "Как работает HNSW?",
+    "tags": ["databases", "exact-term", "narrow"],
+    "relevant": [
+      {"source": "databases.md", "chunk_index": 13}
+    ]
+  },
+  {
+    "id": "q14",
+    "question": "Что означает код 404?",
+    "tags": ["http", "narrow"],
+    "relevant": [
+      {"source": "http_protocol.md", "chunk_index": 2},
+      {"source": "http_protocol.md", "chunk_index": 3}
+    ]
+  },
+  {
+    "id": "q15",
+    "question": "Что такое векторный поиск?",
+    "tags": ["databases", "paraphrase"],
+    "relevant": [
+      {"source": "databases.md", "chunk_index": 11},
+      {"source": "databases.md", "chunk_index": 12}
+    ]
+  },
+
+  {
+    "id": "q16",
+    "question": "Как защитить параллельные транзакции от взаимного влияния?",
+    "tags": ["databases", "paraphrase", "hard"],
+    "relevant": [
+      {"source": "databases.md", "chunk_index": 6},
+      {"source": "databases.md", "chunk_index": 7}
+    ]
+  },
+  {
+    "id": "q17",
+    "question": "Почему многопоточный Python не ускоряет вычисления?",
+    "tags": ["python", "paraphrase", "hard"],
+    "relevant": [
+      {"source": "python_basics.md", "chunk_index": 5}
+    ]
+  },
+  {
+    "id": "q18",
+    "question": "Как клиент и сервер обмениваются данными в реальном времени поверх HTTP?",
+    "tags": ["http", "paraphrase", "hard"],
+    "relevant": [
+      {"source": "http_protocol.md", "chunk_index": 7}
+    ]
+  },
+  {
+    "id": "q19",
+    "question": "Если данных миллион, как быстро найти ближайший вектор?",
+    "tags": ["databases", "paraphrase", "hard"],
+    "relevant": [
+      {"source": "databases.md", "chunk_index": 13}
+    ]
+  },
+  {
+    "id": "q20",
+    "question": "Чем отличается grant access после 401?",
+    "tags": ["http", "cross-domain", "hard"],
+    "relevant": [
+      {"source": "http_protocol.md", "chunk_index": 2},
+      {"source": "http_protocol.md", "chunk_index": 4}
+    ]
+  },
+  {
+    "id": "q21",
+    "question": "Расскажи про index",
+    "tags": ["databases", "cross-language", "hard"],
+    "relevant": [
+      {"source": "databases.md", "chunk_index": 3},
+      {"source": "databases.md", "chunk_index": 4},
+      {"source": "databases.md", "chunk_index": 5}
+    ]
+  },
+  {
+    "id": "q22",
+    "question": "Что выбрать для аналитической колоночной нагрузки?",
+    "tags": ["databases", "paraphrase", "hard"],
+    "relevant": [
+      {"source": "databases.md", "chunk_index": 9}
+    ]
+  },
+  {
+    "id": "q23",
+    "question": "Как сделать стейтлесс stateless авторизацию?",
+    "tags": ["http", "paraphrase", "hard"],
+    "relevant": [
+      {"source": "http_protocol.md", "chunk_index": 0},
+      {"source": "http_protocol.md", "chunk_index": 4}
+    ]
+  },
+  {
+    "id": "q24",
+    "question": "Почему изменения списка как ключа словаря не работают?",
+    "tags": ["python", "paraphrase", "hard"],
+    "relevant": [
+      {"source": "python_basics.md", "chunk_index": 1}
+    ]
+  },
+  {
+    "id": "q25",
+    "question": "Что гарантирует Atomicity в транзакции?",
+    "tags": ["databases", "narrow", "hard"],
+    "relevant": [
+      {"source": "databases.md", "chunk_index": 6}
+    ]
+  },
+  {
+    "id": "q26",
+    "question": "Зачем разделять зависимости между разными Python-проектами?",
+    "tags": ["python", "paraphrase", "hard"],
+    "relevant": [
+      {"source": "python_basics.md", "chunk_index": 4}
+    ]
+  },
+  {
+    "id": "q27",
+    "question": "Чем GiST отличается от обычного индекса?",
+    "tags": ["databases", "narrow", "hard"],
+    "relevant": [
+      {"source": "databases.md", "chunk_index": 4},
+      {"source": "databases.md", "chunk_index": 5}
+    ]
+  },
+  {
+    "id": "q28",
+    "question": "Какая разница между симметричным и ассиметричным ключом в TLS?",
+    "tags": ["http", "narrow", "out-of-corpus"],
+    "relevant": [
+      {"source": "http_protocol.md", "chunk_index": 5}
+    ]
+  },
+  {
+    "id": "q29",
+    "question": "Что такое kNN?",
+    "tags": ["databases", "exact-term", "hard"],
+    "relevant": [
+      {"source": "databases.md", "chunk_index": 13}
+    ]
+  },
+  {
+    "id": "q30",
+    "question": "Можно ли пользоваться MongoDB вместо PostgreSQL и какие компромиссы?",
+    "tags": ["databases", "comparison", "hard"],
+    "relevant": [
+      {"source": "databases.md", "chunk_index": 9},
+      {"source": "databases.md", "chunk_index": 10}
+    ]
+  }
+]

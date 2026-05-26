@@ -89,6 +89,14 @@ class RetrievedChunk:
     # Итоговый RRF-score: чем выше — тем релевантнее в сумме обоих рейтингов.
     rrf_score: float | None = None
 
+    # --- Поля для reranking ---
+    # Оценка от cross-encoder / LLM reranker'а, обычно 0..10. None если
+    # шаг rerank не делался.
+    reranker_score: float | None = None
+    # Позиция чанка ДО reranking'а (1-based в списке, который пришёл от
+    # hybrid/vector/text). Нужна UI чтобы показать «#3 → #1».
+    original_rank: int | None = None
+
 
 @dataclass(frozen=True)
 class ScoredChunk:

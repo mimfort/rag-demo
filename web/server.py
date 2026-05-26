@@ -38,11 +38,28 @@ from pydantic import BaseModel, Field
 from rag.config import settings
 from rag.embedder import LMStudioEmbedder
 from rag.generator import LMStudioGenerator, build_user_prompt
+from rag.reranker import CrossEncoderReranker
 from rag.vector_store import RetrievedChunk, ScoredChunk, VectorStore
+from evals.metrics import ChunkKey, QueryMetrics, aggregate, score_query
+from evals.runner import (
+    GoldenItem,
+    load_golden_set,
+    make_hybrid_rerank_retriever,
+    make_hybrid_retriever,
+    make_text_retriever,
+    make_vector_retriever,
+    split_by_tag,
+)
 
 
 # Допустимые режимы поиска. Используется и в API-моделях, и в логике.
 SEARCH_MODES = ("vector", "text", "hybrid")
+
+# Сколько кандидатов вытаскивать на retrieve-этапе, когда reranking включён.
+# Reranking перемешивает позиции, поэтому имеет смысл взять заметно больше
+# чем top_k — иначе кандидат, который изначально был на 12-м месте, никогда
+# не попадёт в финал, даже если он на самом деле лучший.
+RERANK_CANDIDATE_N = 15
 
 
 # ---------------------------------------------------------------------------
@@ -72,20 +89,37 @@ app = FastAPI(title="RAG demo", version="1.0")
 _embedder: LMStudioEmbedder | None = None
 _store: VectorStore | None = None
 _generator: LMStudioGenerator | None = None
+_reranker: CrossEncoderReranker | None = None
 
 
 @app.on_event("startup")
 def _startup() -> None:
-    """Открываем долгоживущие соединения при старте процесса."""
-    global _embedder, _store, _generator
+    """
+    Открываем долгоживущие соединения при старте процесса.
+
+    Reranker — отдельный кусок: при первой инициализации он скачает
+    модель ~570 МБ с HuggingFace Hub. Дальше — мгновенный старт из кэша.
+    Чтобы не блокировать запуск, если модель ещё не скачана — инициализация
+    в try/except: если что-то пошло не так, сервер всё равно стартует,
+    просто rerank-параметр будет отдавать 503.
+    """
+    global _embedder, _store, _generator, _reranker
     _embedder = LMStudioEmbedder()
     _store = VectorStore()
     _generator = LMStudioGenerator()
+    try:
+        _reranker = CrossEncoderReranker()
+    except Exception as exc:
+        # Не критично для остального API — просто rerank будет недоступен.
+        print(f"⚠ Reranker не инициализирован: {exc}")
+        _reranker = None
 
 
 @app.on_event("shutdown")
 def _shutdown() -> None:
     """Аккуратно закрываем всё при остановке сервера."""
+    if _reranker is not None:
+        _reranker.close()
     if _embedder is not None:
         _embedder.close()
     if _store is not None:
@@ -109,6 +143,9 @@ class AskRequest(BaseModel):
     # обычно даёт лучший recall, особенно на коротких запросах с точными
     # терминами.
     search_mode: str = Field(default="hybrid")
+    # Включить ли LLM-based reranking поверх retrieve-этапа. По умолчанию
+    # выключен — он медленный (несколько секунд на запрос).
+    rerank: bool = Field(default=False)
 
 
 class ChunkOut(BaseModel):
@@ -121,6 +158,9 @@ class ChunkOut(BaseModel):
     text_rank: int | None = None
     text_score: float | None = None
     rrf_score: float | None = None
+    # Reranker-метрики (заполнены если rerank=True)
+    reranker_score: float | None = None
+    original_rank: int | None = None
 
 
 class ScoredOut(BaseModel):
@@ -155,6 +195,9 @@ class ExplainOut(BaseModel):
     below_threshold: bool
     # ── режим поиска (для UI чтобы знать как рисовать чанки) ──────────
     search_mode: str
+    # ── reranking-сводка ─────────────────────────────────────────────
+    reranked: bool
+    rerank_ms: float | None = None  # сколько времени заняло (в мс), если делалось
 
 
 class AskResponse(BaseModel):
@@ -176,6 +219,8 @@ def _to_chunk_out(chunks: list[RetrievedChunk]) -> list[ChunkOut]:
             text_rank=c.text_rank,
             text_score=c.text_score,
             rrf_score=c.rrf_score,
+            reranker_score=c.reranker_score,
+            original_rank=c.original_rank,
         )
         for c in chunks
     ]
@@ -191,6 +236,7 @@ def _retrieve_with_explain(
     top_k: int,
     min_similarity: float = 0.0,
     search_mode: str = "hybrid",
+    rerank: bool = False,
 ) -> tuple[list[RetrievedChunk], ExplainOut]:
     """
     Делает весь retrieval-цикл и собирает образовательный отчёт.
@@ -217,13 +263,15 @@ def _retrieve_with_explain(
     embed_ms = (time.perf_counter() - t0) * 1000.0
 
     # 2. Поиск в выбранном режиме.
-    #    Для top-1 нам нужен embedding чанка чтобы посчитать cosine руками —
-    #    но _store.hybrid_search / text_search его не возвращают.
-    #    Поэтому отдельным запросом достаём вектор top-1 чанка ниже.
+    #    Когда включён rerank, нам нужно МНОГО кандидатов (RERANK_CANDIDATE_N),
+    #    чтобы reranker имел из чего выбирать. Иначе хороший чанк, который
+    #    изначально оказался на 12-м месте, никогда не попадёт в top_k.
+    fetch_n = RERANK_CANDIDATE_N if rerank else top_k
+
     if search_mode == "vector":
-        chunks = _store.search(query_vec, top_k=top_k, include_embeddings=True)
+        chunks = _store.search(query_vec, top_k=fetch_n, include_embeddings=True)
     elif search_mode == "text":
-        text_hits = _store.text_search(query, top_n=top_k)
+        text_hits = _store.text_search(query, top_n=fetch_n)
         chunks = [
             RetrievedChunk(
                 source=h.source,
@@ -237,8 +285,28 @@ def _retrieve_with_explain(
         ]
     else:  # hybrid
         chunks = _store.hybrid_search(
-            query, query_vec, top_k=top_k, candidate_n=20
+            query, query_vec, top_k=fetch_n, candidate_n=20
         )
+
+    # 2.5. Reranking — опционально. После него у каждого чанка появляется
+    #      reranker_score и original_rank (позиция до rerank). Сортировка
+    #      по reranker_score. Обрезаем до top_k.
+    rerank_ms: float | None = None
+    actually_reranked = False
+    if rerank and chunks:
+        if _reranker is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Reranker не инициализирован (модель ещё не скачана?)",
+            )
+        t_rr = time.perf_counter()
+        chunks = _reranker.rerank(query, chunks, top_k=top_k)
+        rerank_ms = round((time.perf_counter() - t_rr) * 1000.0, 1)
+        actually_reranked = True
+    elif not rerank:
+        # rerank выключен — обрезаем сами до top_k (выше брали fetch_n=top_k,
+        # но если когда-нибудь поменяем логику — этот срез лишним не будет).
+        chunks = chunks[:top_k]
 
     # 3. Similarity для ВСЕХ чанков базы — для гистограммы в UI.
     #    Не зависит от search_mode: гистограмма всегда показывает cosine,
@@ -292,6 +360,8 @@ def _retrieve_with_explain(
         min_similarity=min_similarity,
         below_threshold=below,
         search_mode=search_mode,
+        reranked=actually_reranked,
+        rerank_ms=rerank_ms,
     )
     return chunks, explain
 
@@ -310,7 +380,7 @@ def ask(req: AskRequest) -> AskResponse:
     assert _generator is not None  # для тайп-чекера
 
     chunks, explain = _retrieve_with_explain(
-        req.query, req.top_k, req.min_similarity, req.search_mode,
+        req.query, req.top_k, req.min_similarity, req.search_mode, req.rerank,
     )
     if not chunks:
         raise HTTPException(
@@ -351,6 +421,7 @@ def ask_stream(
     top_k: int = settings.top_k,
     min_similarity: float = 0.0,
     search_mode: str = "hybrid",
+    rerank: bool = False,
 ) -> StreamingResponse:
     """
     Streaming-версия. Шлёт три типа событий:
@@ -366,7 +437,7 @@ def ask_stream(
         raise HTTPException(status_code=400, detail="query пуст")
 
     chunks, explain = _retrieve_with_explain(
-        query, top_k, min_similarity, search_mode,
+        query, top_k, min_similarity, search_mode, rerank,
     )
 
     def event_source() -> Iterator[str]:
@@ -409,6 +480,109 @@ def ask_stream(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Evaluation endpoint — прогон голден-сета через все конфиги.
+# ---------------------------------------------------------------------------
+def _run_evaluation(
+    items: list[GoldenItem],
+    top_k: int,
+    include_rerank: bool,
+) -> dict:
+    """
+    Прогоняет голден-сет через все retrieval-конфиги и собирает метрики.
+
+    Делаем синхронно — на 30 запросах и без rerank это ~3 секунды, с rerank ~30.
+    Для учебного демо нормально, в production выносят в background-task.
+    """
+    assert _embedder is not None and _store is not None
+
+    configs: list[tuple[str, object]] = [
+        ("vector", make_vector_retriever(_embedder, _store, top_k)),
+        ("text",   make_text_retriever(_store, top_k)),
+        ("hybrid", make_hybrid_retriever(_embedder, _store, top_k)),
+    ]
+    if include_rerank:
+        if _reranker is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Reranker не инициализирован",
+            )
+        configs.append((
+            "hybrid+rerank",
+            make_hybrid_rerank_retriever(_embedder, _store, _reranker, top_k),
+        ))
+
+    aggregates: dict[str, dict] = {}
+    details_by_config: dict[str, list[tuple[GoldenItem, QueryMetrics]]] = {}
+
+    for name, retriever in configs:
+        per_query: list[QueryMetrics] = []
+        latencies: list[float] = []
+        details: list[tuple[GoldenItem, QueryMetrics]] = []
+        for item in items:
+            t0 = time.perf_counter()
+            retrieved = retriever(item.question)
+            latencies.append((time.perf_counter() - t0) * 1000.0)
+            m = score_query(retrieved, item.relevant, k=top_k)
+            per_query.append(m)
+            details.append((item, m))
+
+        agg = aggregate(per_query, latencies)
+        aggregates[name] = {
+            "n_queries": agg.n_queries,
+            "hit_rate": agg.hit_rate,
+            "recall_at_k": agg.recall_at_k,
+            "precision_at_k": agg.precision_at_k,
+            "mrr": agg.mrr,
+            "avg_latency_ms": agg.avg_latency_ms,
+        }
+        details_by_config[name] = details
+
+    # Разбивка по тегам: для каждого тега → MRR каждого конфига.
+    all_tags: list[str] = []
+    for item in items:
+        for t in item.tags:
+            if t not in all_tags:
+                all_tags.append(t)
+
+    by_tag: list[dict] = []
+    for tag in all_tags:
+        n = sum(1 for it in items if tag in it.tags)
+        row: dict = {"tag": tag, "n": n}
+        for cfg_name in aggregates:
+            tag_metrics = split_by_tag(details_by_config[cfg_name], tag)
+            if tag_metrics:
+                row[cfg_name] = (
+                    sum(m.reciprocal_rank for m in tag_metrics) / len(tag_metrics)
+                )
+            else:
+                row[cfg_name] = None
+        by_tag.append(row)
+
+    return {
+        "n_queries": len(items),
+        "top_k": top_k,
+        "aggregates": aggregates,
+        "by_tag": by_tag,
+    }
+
+
+class EvalRequest(BaseModel):
+    top_k: int = Field(default=5, ge=1, le=20)
+    include_rerank: bool = Field(default=False)
+
+
+@app.post("/api/eval")
+def run_evaluation(req: EvalRequest) -> dict:
+    """
+    Прогон голден-сета. По умолчанию без rerank (тогда быстро, ~3 сек),
+    с include_rerank=True долго (~30 сек) но видно как cross-encoder
+    помогает на сложных запросах.
+    """
+    items = load_golden_set()
+    return _run_evaluation(items, req.top_k, req.include_rerank)
 
 
 # ---------------------------------------------------------------------------

@@ -271,7 +271,55 @@
     .badge-mini.txt b { color: var(--green); }
     .badge-mini.rrf { border-color: rgba(224, 175, 104, 0.4); }
     .badge-mini.rrf b { color: var(--orange); }
+    .badge-mini.rrk { border-color: rgba(187, 154, 247, 0.5); }
+    .badge-mini.rrk b { color: #bb9af7; }
     .badge-mini.muted { opacity: 0.4; }
+
+    /* Индикатор изменения позиции после rerank: «#3 → #1» */
+    .rank-shift {
+      font: 11px var(--mono);
+      padding: 1px 6px;
+      border-radius: 4px;
+      margin-left: 6px;
+    }
+    .rank-shift.up   { background: rgba(158, 206, 106, 0.15); color: var(--green); }
+    .rank-shift.down { background: rgba(224, 175, 104, 0.15); color: var(--orange); }
+    .rank-shift.same { background: var(--panel-2); color: var(--muted); }
+
+    /* Eval-панель внизу страницы — отдельная секция */
+    .eval-section {
+      margin-top: 28px;
+      padding-top: 20px;
+      border-top: 1px solid var(--border);
+    }
+    table.metrics {
+      width: 100%;
+      border-collapse: collapse;
+      font: 13px var(--mono);
+      margin-top: 10px;
+    }
+    table.metrics th, table.metrics td {
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--border);
+      text-align: right;
+    }
+    table.metrics th { text-align: left; color: var(--muted); font-weight: 500; }
+    table.metrics td:first-child, table.metrics th:first-child { text-align: left; }
+    table.metrics td.best { color: var(--green); font-weight: 700; }
+    table.metrics td.worst { color: var(--orange); }
+    table.metrics tr.row-name { color: var(--accent); }
+    .metric-help {
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 4px;
+      line-height: 1.5;
+    }
+    .eval-controls {
+      display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
+      margin-bottom: 8px;
+    }
+    .eval-controls .checkbox { font-size: 13px; }
+    button.eval-btn { padding: 8px 14px; font-size: 14px; }
 
     /* Citation chip [N] внутри ответа LLM */
     .citation {
@@ -352,6 +400,17 @@
       </div>
 
       <div style="margin-top: 12px;">
+        <div class="checkbox">
+          <input id="rerank" type="checkbox">
+          <label for="rerank" style="margin:0">rerank (cross-encoder)</label>
+        </div>
+        <div class="sub" style="margin: 4px 0 0; font-size: 12px;">
+          второй проход через bge-reranker-v2-m3 поверх top-15 кандидатов.
+          добавит латентности, но точнее ранжирование.
+        </div>
+      </div>
+
+      <div style="margin-top: 12px;">
         <div class="slider-row">
           <label for="minSim" style="margin:0">min similarity</label>
           <span class="val" id="minSimVal">0.50</span>
@@ -395,7 +454,9 @@
       <div class="sub" style="margin: 0 0 8px;">
         Бейджи в карточке: <b style="color:var(--accent)">cos</b> — cosine similarity и ранг в vector-поиске,
         <b style="color:var(--green)">bm25</b> — ts_rank_cd и ранг в text-поиске,
-        <b style="color:var(--orange)">rrf</b> — итоговый Reciprocal Rank Fusion score.
+        <b style="color:var(--orange)">rrf</b> — итоговый Reciprocal Rank Fusion score,
+        <b style="color:#bb9af7">rrk</b> — cross-encoder reranker score (если включён).
+        Стрелка <span style="color:var(--green)">#3 → #1</span> показывает как изменилась позиция после rerank.
       </div>
       <div id="chunks" class="chunks">
         <div class="sub">Здесь появятся найденные чанки и их similarity-score.</div>
@@ -435,6 +496,37 @@
       <div id="warnBox"></div>
       <pre id="answer" class="answer answer-pending">Жду вопроса…</pre>
     </div>
+  </div>
+</div>
+
+<!-- =============================================================
+     EVAL SECTION — прогон голден-сета через все конфиги retrieval.
+     Это отдельный сценарий, не связанный с одиночным запросом сверху.
+     ============================================================= -->
+<div class="eval-section">
+  <div class="panel">
+    <h2>Бенчмарк: сравнение конфигов на голден-сете</h2>
+    <div class="metric-help">
+      Прогоняет ~30 размеченных вопросов через vector / text / hybrid (и опционально hybrid+rerank).
+      Считает <b style="color:var(--text)">hit@k</b>, <b style="color:var(--text)">recall</b>,
+      <b style="color:var(--text)">precision</b>, <b style="color:var(--text)">MRR</b> и среднее время.
+      Лучшее значение в колонке подсвечено зелёным, худшее — оранжевым.
+    </div>
+
+    <div class="eval-controls" style="margin-top: 14px;">
+      <div>
+        <label for="evalK" style="display:inline; margin-right: 6px;">top_k:</label>
+        <input id="evalK" type="number" min="1" max="20" value="5" style="width:60px;display:inline-block;">
+      </div>
+      <div class="checkbox">
+        <input id="evalRerank" type="checkbox">
+        <label for="evalRerank" style="margin:0">включить rerank (~30 сек)</label>
+      </div>
+      <button id="evalBtn" class="eval-btn">Запустить</button>
+      <span id="evalStatus" class="sub" style="margin: 0;"></span>
+    </div>
+
+    <div id="evalResults"></div>
   </div>
 </div>
 
@@ -523,15 +615,37 @@ function renderChunks(chunks, mode = "hybrid") {
       createEl("span", { class: "src" }, `${c.source}#${c.chunk_index}`));
 
     let primaryScore;
-    if (mode === "text") {
+    if (c.reranker_score != null) {
+      // Если был rerank — основная метрика именно reranker_score.
+      // Это и есть «причина» почему чанк здесь.
+      primaryScore = Number(c.reranker_score).toFixed(4);
+    } else if (mode === "text") {
       primaryScore = (c.text_score != null ? c.text_score : 0).toFixed(4);
     } else if (mode === "hybrid") {
       primaryScore = (c.rrf_score != null ? c.rrf_score : 0).toFixed(4);
     } else {
       primaryScore = Number(c.similarity).toFixed(4);
     }
+
+    // Стрелка-индикатор изменения позиции после rerank: #3 → #1 / #1 → #4.
+    const headLeftWrap = createEl("div", null, headLeft);
+    if (c.original_rank != null) {
+      const newRank = i + 1;
+      const shift = c.original_rank - newRank;  // >0 = поднялся
+      let shiftClass = "same";
+      let shiftText = `#${c.original_rank} → #${newRank}`;
+      if (shift > 0) shiftClass = "up";
+      else if (shift < 0) shiftClass = "down";
+      const indicator = createEl(
+        "span",
+        { class: "rank-shift " + shiftClass, title: shiftText },
+        shiftText
+      );
+      headLeftWrap.appendChild(indicator);
+    }
+
     const headRight = createEl("span", { class: "score" }, primaryScore);
-    const head = createEl("div", { class: "chunk-head" }, headLeft, headRight);
+    const head = createEl("div", { class: "chunk-head" }, headLeftWrap, headRight);
 
     const body = createEl("div", { class: "chunk-body" }, preview);
 
@@ -558,6 +672,12 @@ function renderChunks(chunks, mode = "hybrid") {
         "rrf",
         c.rrf_score != null ? c.rrf_score.toFixed(4) : "—",
         c.rrf_score != null
+      ),
+      badge(
+        "rrk",
+        "rrk",
+        c.reranker_score != null ? c.reranker_score.toFixed(4) : "—",
+        c.reranker_score != null
       ),
     );
 
@@ -841,14 +961,14 @@ async function pingHealth() {
 pingHealth();
 
 // --- Обычный (нестриминговый) запрос ---
-async function askNormal(query, topK, minSim, mode) {
+async function askNormal(query, topK, minSim, mode, rerank) {
   const t0 = performance.now();
   activeAbort = new AbortController();
   const resp = await fetch("/api/ask", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      query, top_k: topK, min_similarity: minSim, search_mode: mode,
+      query, top_k: topK, min_similarity: minSim, search_mode: mode, rerank,
     }),
     signal: activeAbort.signal,
   });
@@ -874,12 +994,13 @@ async function askNormal(query, topK, minSim, mode) {
 }
 
 // --- Streaming-запрос через SSE ---
-function askStream(query, topK, minSim, mode) {
+function askStream(query, topK, minSim, mode, rerank) {
   return new Promise((resolve, reject) => {
     const t0 = performance.now();
     // EventSource поддерживает только GET — поэтому параметры через query string.
     const url = `/api/ask/stream?query=${encodeURIComponent(query)}`
-              + `&top_k=${topK}&min_similarity=${minSim}&search_mode=${mode}`;
+              + `&top_k=${topK}&min_similarity=${minSim}&search_mode=${mode}`
+              + `&rerank=${rerank ? "true" : "false"}`;
     const es = new EventSource(url);
     activeSource = es;
 
@@ -942,6 +1063,7 @@ $("askBtn").addEventListener("click", async () => {
   const minSim = parseFloat($("minSim").value) || 0;
   const useStream = $("stream").checked;
   const mode = (document.querySelector('input[name="searchMode"]:checked') || {}).value || "hybrid";
+  const rerank = $("rerank").checked;
   if (!query) {
     showError("Введи вопрос.");
     return;
@@ -957,9 +1079,9 @@ $("askBtn").addEventListener("click", async () => {
 
   try {
     if (useStream) {
-      await askStream(query, topK, minSim, mode);
+      await askStream(query, topK, minSim, mode, rerank);
     } else {
-      await askNormal(query, topK, minSim, mode);
+      await askNormal(query, topK, minSim, mode, rerank);
     }
     pingHealth();
   } catch (e) {
@@ -983,6 +1105,173 @@ $("abortBtn").addEventListener("click", () => {
 $("q").addEventListener("keydown", (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === "Enter") $("askBtn").click();
 });
+
+/* =============================================================
+   EVAL — прогон голден-сета через все конфиги, сравнительная таблица.
+   ============================================================= */
+
+// Метрики где «больше = лучше» (выделяем зелёным max, оранжевым min):
+const HIGHER_IS_BETTER = new Set([
+  "hit_rate", "recall_at_k", "precision_at_k", "mrr",
+]);
+// Метрики где «меньше = лучше»:
+const LOWER_IS_BETTER = new Set(["avg_latency_ms"]);
+
+// Отображаемые имена метрик и форматтеры.
+const METRIC_LABELS = {
+  hit_rate:        ["hit@k",     (v) => v.toFixed(3)],
+  recall_at_k:     ["recall@k",  (v) => v.toFixed(3)],
+  precision_at_k:  ["precision", (v) => v.toFixed(3)],
+  mrr:             ["MRR",       (v) => v.toFixed(3)],
+  avg_latency_ms:  ["ms/query",  (v) => v.toFixed(0)],
+};
+
+function classifyValue(metric, value, allValues) {
+  // Какой класс CSS поставить ячейке: best / worst / "".
+  const nums = allValues.filter((v) => typeof v === "number");
+  if (nums.length < 2) return "";
+  const min = Math.min(...nums);
+  const max = Math.max(...nums);
+  if (HIGHER_IS_BETTER.has(metric)) {
+    if (value === max && value !== min) return "best";
+    if (value === min && value !== max) return "worst";
+  } else if (LOWER_IS_BETTER.has(metric)) {
+    if (value === min && value !== max) return "best";
+    if (value === max && value !== min) return "worst";
+  }
+  return "";
+}
+
+function renderAggregates(aggregates) {
+  const root = $("evalResults");
+  root.replaceChildren();
+
+  const configs = Object.keys(aggregates);
+  if (!configs.length) return;
+
+  const heading = createEl("h3", { style: "font-size:13px;text-transform:uppercase;letter-spacing:0.06em;color:var(--muted);margin:18px 0 6px;" }, "Сводные метрики");
+  root.appendChild(heading);
+
+  const table = createEl("table", { class: "metrics" });
+  const thead = createEl("thead");
+  const headRow = createEl("tr");
+  headRow.appendChild(createEl("th", null, "config"));
+  for (const m of Object.keys(METRIC_LABELS)) {
+    headRow.appendChild(createEl("th", null, METRIC_LABELS[m][0]));
+  }
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+
+  // Для каждой метрики собираем массив значений всех конфигов — чтобы найти best/worst.
+  const metricValues = {};
+  for (const m of Object.keys(METRIC_LABELS)) {
+    metricValues[m] = configs.map((cfg) => aggregates[cfg][m]);
+  }
+
+  const tbody = createEl("tbody");
+  for (const cfg of configs) {
+    const row = createEl("tr", { class: "row-name" });
+    row.appendChild(createEl("td", null, cfg));
+    for (const m of Object.keys(METRIC_LABELS)) {
+      const value = aggregates[cfg][m];
+      const cls = classifyValue(m, value, metricValues[m]);
+      const cell = createEl("td", { class: cls }, METRIC_LABELS[m][1](value));
+      row.appendChild(cell);
+    }
+    tbody.appendChild(row);
+  }
+  table.appendChild(tbody);
+  root.appendChild(table);
+}
+
+function renderByTag(byTag, configNames) {
+  if (!byTag.length) return;
+  const root = $("evalResults");
+
+  const heading = createEl("h3", { style: "font-size:13px;text-transform:uppercase;letter-spacing:0.06em;color:var(--muted);margin:24px 0 6px;" }, "MRR по тегам");
+  const help = createEl("div", { class: "metric-help", style: "margin-bottom:8px;" },
+    "Здесь видно где какой подход выигрывает: ", createEl("b", null, "exact-term"),
+    " — текстовый поиск; ", createEl("b", null, "paraphrase"), " и ",
+    createEl("b", null, "hard"), " — vector и особенно reranker.");
+  root.appendChild(heading);
+  root.appendChild(help);
+
+  const table = createEl("table", { class: "metrics" });
+  const thead = createEl("thead");
+  const headRow = createEl("tr");
+  headRow.appendChild(createEl("th", null, "tag"));
+  headRow.appendChild(createEl("th", null, "n"));
+  for (const c of configNames) headRow.appendChild(createEl("th", null, c));
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+
+  const tbody = createEl("tbody");
+  for (const row of byTag) {
+    const tr = createEl("tr");
+    tr.appendChild(createEl("td", null, row.tag));
+    tr.appendChild(createEl("td", null, String(row.n)));
+    // Найдём лучший конфиг в этой строке по MRR.
+    const vals = configNames.map((c) => (typeof row[c] === "number" ? row[c] : null));
+    const valid = vals.filter((v) => v !== null);
+    const max = valid.length ? Math.max(...valid) : null;
+    const min = valid.length ? Math.min(...valid) : null;
+    for (let i = 0; i < configNames.length; i++) {
+      const v = vals[i];
+      if (v === null) {
+        tr.appendChild(createEl("td", { class: "muted" }, "—"));
+      } else {
+        let cls = "";
+        if (max !== min) {
+          if (v === max) cls = "best";
+          else if (v === min) cls = "worst";
+        }
+        tr.appendChild(createEl("td", { class: cls }, v.toFixed(3)));
+      }
+    }
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  root.appendChild(table);
+}
+
+async function runBenchmark() {
+  const k = parseInt($("evalK").value, 10) || 5;
+  const includeRerank = $("evalRerank").checked;
+  const btn = $("evalBtn");
+  const status = $("evalStatus");
+
+  btn.disabled = true;
+  $("evalResults").replaceChildren();
+  status.textContent = includeRerank
+    ? "Прогоняю (с rerank, это ~30 секунд)…"
+    : "Прогоняю (быстрый режим)…";
+
+  const t0 = performance.now();
+  try {
+    const resp = await fetch("/api/eval", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ top_k: k, include_rerank: includeRerank }),
+    });
+    if (!resp.ok) {
+      const text = await resp.text();
+      throw new Error(`HTTP ${resp.status}: ${text}`);
+    }
+    const data = await resp.json();
+    const elapsed = Math.round(performance.now() - t0);
+    status.textContent =
+      `Готово за ${elapsed} мс. Запросов: ${data.n_queries}, top_k=${data.top_k}.`;
+
+    renderAggregates(data.aggregates);
+    renderByTag(data.by_tag, Object.keys(data.aggregates));
+  } catch (e) {
+    status.textContent = "Ошибка: " + (e.message || String(e));
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+$("evalBtn").addEventListener("click", runBenchmark);
 </script>
 
 </body>
