@@ -103,10 +103,19 @@ export function MessageBubble({
   streaming,
 }: Props) {
   const [detailsOpen, setDetailsOpen] = React.useState(false);
-  const hasDetails = role === "assistant" && explain != null;
+  // Условие «ручной bypass»: RAG был пропущен, но не из-за router'а
+  // (router заполнил бы routed=true и route_intent). Если routed=false и
+  // rag_skipped=true — значит пользователь явно выбрал режим Off.
+  const isManualBypass =
+    role === "assistant" &&
+    explain != null &&
+    explain.rag_skipped === true &&
+    !explain.routed;
+  const hasDetails =
+    role === "assistant" && explain != null && !isManualBypass;
 
   return (
-    <div className={cn("flex gap-3 group", role === "user" ? "flex-row-reverse" : "flex-row")}>
+    <div className={cn("flex gap-3 group", role === "user" ? "flex-row-reverse" : "flex-row", isManualBypass && "mb-5")}>
       <div
         className={cn(
           "h-7 w-7 shrink-0 rounded-full flex items-center justify-center border",
@@ -189,6 +198,14 @@ export function MessageBubble({
             >
               <Sparkles className="h-3.5 w-3.5" />
             </button>
+          )}
+          {isManualBypass && (
+            <div className="absolute -bottom-5 left-0 text-[10px] text-muted-foreground">
+              <span className="inline-flex items-center gap-1 rounded-full border border-border bg-card px-2 py-0.5">
+                <span aria-hidden>○</span>
+                RAG не использовался — режим обычного чата
+              </span>
+            </div>
           )}
         </div>
       </div>
