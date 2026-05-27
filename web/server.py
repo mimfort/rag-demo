@@ -236,6 +236,10 @@ class AskRequest(BaseModel):
     # "knowledge" — отвечаем напрямую без RAG. Экономит время на chitchat
     # и meta-вопросах.
     auto_route: bool = False
+    # Принудительный bypass RAG: пользователь явно выбрал режим без
+    # retrieval. В отличие от auto_route, тут не запускается классификатор —
+    # сразу идём в _generate_direct_answer с intent="general".
+    bypass_rag: bool = False
 
 
 class ChunkOut(BaseModel):
@@ -912,6 +916,13 @@ _OTHER_SYSTEM = (
     "у тебя есть только техническая документация. Не выдумывай ответ."
 )
 
+_GENERAL_SYSTEM = (
+    "Ты — полезный ассистент. Отвечай по делу и кратко. Если пользователь "
+    "просит помочь с задачей, для которой пригодилась бы база знаний — "
+    "напомни, что в чате есть переключатель режима RAG и его можно "
+    "включить или поставить в Auto."
+)
+
 
 def _generate_direct_answer(
     query: str,
@@ -932,13 +943,17 @@ def _generate_direct_answer(
         system = _META_SYSTEM
     elif intent == "other":
         system = _OTHER_SYSTEM
+    elif intent == "general":
+        system = _GENERAL_SYSTEM
     else:
         # Шафтовая защита: пришёл не-поддерживаемый intent — отвечаем нейтрально.
         system = _CHITCHAT_SYSTEM
 
     # Для meta даём явную историю в user-промпте, иначе LLM не сможет
-    # сослаться на «предыдущие сообщения».
-    if intent == "meta" and history:
+    # сослаться на «предыдущие сообщения». Для general — тоже подмешиваем
+    # историю: пользователь явно выбрал режим без RAG, но LLM лучше
+    # отвечает с памятью предыдущих реплик.
+    if intent in ("meta", "general") and history:
         hist_block = "\n".join(
             f"{m.role}: {m.content}" for m in history
         )
@@ -1104,6 +1119,24 @@ def ask(req: AskRequest) -> AskResponse:
     """Обычный (нестриминговый) RAG-запрос."""
     assert _generator is not None  # для тайп-чекера
 
+    # 0. Bypass RAG: пользователь явно выбрал режим без retrieve.
+    if req.bypass_rag:
+        history = (
+            _history_store.get_recent(req.chat_id, limit=8)
+            if req.chat_id and _history_store else []
+        )
+        answer = _generate_direct_answer(
+            req.query, history, intent="general", stream=False,
+        )
+        explain = _empty_explain(chat_id=req.chat_id)
+        _save_chat_messages(
+            req.chat_id, req.query, answer,
+            explain=explain.model_dump(),
+        )
+        return AskResponse(
+            chunks=[], prompt="", answer=answer, explain=explain,
+        )
+
     # 0a. Router: классифицируем intent. Если включён и intent != knowledge —
     #     пропускаем RAG, отвечаем напрямую.
     route_info: dict = {}
@@ -1216,6 +1249,7 @@ def ask_stream(
     rewrite_n: int = 3,
     chat_id: str | None = None,
     auto_route: bool = False,
+    bypass_rag: bool = False,
 ) -> StreamingResponse:
     """
     Streaming-версия. Шлёт три типа событий:
@@ -1229,6 +1263,38 @@ def ask_stream(
 
     if not query.strip():
         raise HTTPException(status_code=400, detail="query пуст")
+
+    # 0. Bypass RAG: пользователь явно выбрал режим без retrieve.
+    if bypass_rag:
+        history = (
+            _history_store.get_recent(chat_id, limit=8)
+            if chat_id and _history_store else []
+        )
+        explain = _empty_explain(chat_id=chat_id)
+
+        def bypass_event_source() -> Iterator[str]:
+            yield _sse_event("meta", {
+                "chunks": [],
+                "prompt": "",
+                "explain": explain.model_dump(),
+            })
+            full = []
+            for piece in _generate_direct_answer(
+                query, history, intent="general", stream=True,
+            ):
+                full.append(piece)
+                yield _sse_event("token", {"text": piece})
+            _save_chat_messages(
+                chat_id, query, "".join(full),
+                explain=explain.model_dump(),
+            )
+            yield _sse_event("done", {})
+
+        return StreamingResponse(
+            bypass_event_source(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     # 0a. Router: классифицируем intent. Если включён и intent != knowledge —
     #     стримим прямой ответ без retrieve-этапа.
