@@ -34,6 +34,11 @@ export function ChatView({ chatId }: Props) {
   const queryClient = useQueryClient();
   const router = useRouter();
   const settings = useSettings((s) => s.getFor(chatId));
+  const setSettings = useSettings((s) => s.setFor);
+  const handleRagModeChange = React.useCallback(
+    (v: typeof settings.rag_mode) => setSettings(chatId, { rag_mode: v }),
+    [chatId, setSettings],
+  );
   const draft = useChatUi((s) => s.draft);
   const setDraft = useChatUi((s) => s.setDraft);
   const updateDraft = useChatUi((s) => s.updateDraft);
@@ -276,9 +281,7 @@ export function ChatView({ chatId }: Props) {
         onOpenSettings={() => setSettingsOpen(true)}
         busy={isStreaming}
         ragMode={settings.rag_mode}
-        onRagModeChange={(v) =>
-          useSettings.getState().setFor(chatId, { rag_mode: v })
-        }
+        onRagModeChange={handleRagModeChange}
       />
 
       <SettingsDrawer
@@ -298,8 +301,9 @@ function EmptyState() {
       </div>
       <h2 className="text-xl font-semibold">Чат с базой знаний</h2>
       <p className="text-sm text-muted-foreground max-w-md">
-        Задай вопрос — система найдёт ответ в загруженных документах. Включи
-        auto-route в настройках чтобы LLM сам решал когда нужен RAG.
+        Задай вопрос — система найдёт ответ в загруженных документах.
+        Переключателем RAG в строке ввода можно выбрать Auto (LLM сам решает),
+        On (всегда искать) или Off (обычный чат без базы).
       </p>
       <div className="flex items-center gap-2 mt-2 text-xs text-muted-foreground">
         <MessageSquare className="h-3.5 w-3.5" />

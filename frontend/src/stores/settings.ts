@@ -86,7 +86,7 @@ export const useSettings = create<SettingsState>()(
             s && s.rag_mode === undefined ? { ...s, rag_mode: "auto" } : s;
           return {
             ...persistedState,
-            default: fixDef(persistedState.default) ?? persistedState.default,
+            default: fixDef(persistedState.default) ?? DEFAULT_SETTINGS,
             perChat: Object.fromEntries(
               Object.entries(persistedState.perChat ?? {}).map(
                 ([k, v]) => [k, fixDef(v)],
