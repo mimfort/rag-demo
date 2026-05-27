@@ -1370,16 +1370,20 @@ def ask_stream(
                 "prompt": "",
                 "explain": explain.model_dump(),
             })
-            full = []
-            for piece in _generate_direct_answer(
-                query, history, intent="general", stream=True,
-            ):
-                full.append(piece)
-                yield _sse_event("token", {"text": piece})
-            _save_chat_messages(
-                chat_id, query, "".join(full),
-                explain=explain.model_dump(),
-            )
+            full: list[str] = []
+            try:
+                for piece in _generate_direct_answer(
+                    query, history, intent="general", stream=True,
+                ):
+                    full.append(piece)
+                    yield _sse_event("token", {"text": piece})
+            finally:
+                # Сохраняем даже при дисконнекте — иначе ответ уехал, но в БД его нет.
+                if full:
+                    _save_chat_messages(
+                        chat_id, query, "".join(full),
+                        explain=explain.model_dump(),
+                    )
             yield _sse_event("done", {})
 
         return StreamingResponse(
@@ -1411,16 +1415,19 @@ def ask_stream(
                 "prompt": "",
                 "explain": explain.model_dump(),
             })
-            full = []
-            for piece in _generate_direct_answer(
-                query, history, direct_intent, stream=True,
-            ):
-                full.append(piece)
-                yield _sse_event("token", {"text": piece})
-            _save_chat_messages(
-                chat_id, query, "".join(full),
-                explain=explain.model_dump(),
-            )
+            full: list[str] = []
+            try:
+                for piece in _generate_direct_answer(
+                    query, history, direct_intent, stream=True,
+                ):
+                    full.append(piece)
+                    yield _sse_event("token", {"text": piece})
+            finally:
+                if full:
+                    _save_chat_messages(
+                        chat_id, query, "".join(full),
+                        explain=explain.model_dump(),
+                    )
             yield _sse_event("done", {})
 
         return StreamingResponse(
@@ -1505,20 +1512,22 @@ def ask_stream(
             token_iter = _generator.generate_stream(
                 effective_query, chunks_for_prompt,
             )
-        for piece in token_iter:
-            full_answer_parts.append(piece)
-            yield _sse_event("token", {"text": piece})
-
-        # 3. Сохраняем сообщения в историю (если работаем в чате) с полным
-        #    pipeline-снимком. После refresh UI восстановит шаги. При
-        #    auto-fallback prompt не пишем (пустой).
-        full_answer = "".join(full_answer_parts)
-        _save_chat_messages(
-            chat_id, query, full_answer,
-            chunks=chunks_serializable,
-            explain=explain_dict,
-            prompt=prompt_text if prompt_text else None,
-        )
+        try:
+            for piece in token_iter:
+                full_answer_parts.append(piece)
+                yield _sse_event("token", {"text": piece})
+        finally:
+            # 3. Сохраняем сообщения в историю даже если клиент отвалился
+            #    (GeneratorExit на yield во время стрима). Иначе ответ
+            #    «уехал» в UI, но в БД его нет — после reload бабл пропадает.
+            if full_answer_parts:
+                full_answer = "".join(full_answer_parts)
+                _save_chat_messages(
+                    chat_id, query, full_answer,
+                    chunks=chunks_serializable,
+                    explain=explain_dict,
+                    prompt=prompt_text if prompt_text else None,
+                )
 
         # 4. Сигнал конца.
         yield _sse_event("done", {})
