@@ -275,6 +275,10 @@ export function ChatView({ chatId }: Props) {
         onStop={handleStop}
         onOpenSettings={() => setSettingsOpen(true)}
         busy={isStreaming}
+        ragMode={settings.rag_mode}
+        onRagModeChange={(v) =>
+          useSettings.getState().setFor(chatId, { rag_mode: v })
+        }
       />
 
       <SettingsDrawer

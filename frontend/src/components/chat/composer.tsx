@@ -4,6 +4,8 @@ import * as React from "react";
 import { Send, StopCircle, Settings2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import type { RagMode } from "@/lib/types";
+import { RagModeChip } from "./rag-mode-chip";
 
 interface Props {
   onSend: (text: string) => void;
@@ -13,9 +15,14 @@ interface Props {
   busy?: boolean;
   /** Подсказка-плейсхолдер. */
   placeholder?: string;
+  ragMode: RagMode;
+  onRagModeChange: (v: RagMode) => void;
 }
 
-export function Composer({ onSend, onStop, onOpenSettings, busy, placeholder }: Props) {
+export function Composer({
+  onSend, onStop, onOpenSettings, busy, placeholder,
+  ragMode, onRagModeChange,
+}: Props) {
   const [text, setText] = React.useState("");
   const taRef = React.useRef<HTMLTextAreaElement>(null);
 
@@ -38,6 +45,9 @@ export function Composer({ onSend, onStop, onOpenSettings, busy, placeholder }: 
     <div className="border-t border-border bg-background p-4">
       <div className="mx-auto max-w-3xl">
         <div className="flex items-end gap-2 rounded-2xl border border-border bg-card p-2 focus-within:border-primary/60 transition-colors">
+          <div className="self-center">
+            <RagModeChip value={ragMode} onChange={onRagModeChange} />
+          </div>
           {onOpenSettings && (
             <Button
               variant="ghost"
