@@ -77,22 +77,6 @@ export function ChatView({ chatId }: Props) {
     },
   });
 
-  /** Отправить вопрос: streaming или non-streaming в зависимости от настроек. */
-  const handleSend = React.useCallback(
-    async (text: string) => {
-      // Если работаем «без чата» — создаём чат и переходим в него,
-      // первое сообщение отправит уже там (см. эффект ниже через query).
-      if (chatId === null) {
-        const chat = await createChat.mutateAsync(text);
-        // Стартуем стрим сразу — но через новый chatId.
-        startStream(text, chat.id);
-        return;
-      }
-      startStream(text, chatId);
-    },
-    [chatId, createChat],
-  );
-
   /** Подготовка и запуск SSE / REST. */
   const startStream = React.useCallback(
     (text: string, targetChatId: string) => {
@@ -211,6 +195,25 @@ export function ChatView({ chatId }: Props) {
       }
     },
     [draft, settings, queryClient, setDraft, updateDraft, setLastAnswer],
+  );
+
+  /** Отправить вопрос: streaming или non-streaming в зависимости от настроек. */
+  const handleSend = React.useCallback(
+    async (text: string) => {
+      // Если работаем «без чата» — создаём чат и переходим в него,
+      // первое сообщение отправит уже там (см. эффект ниже через query).
+      if (chatId === null) {
+        const chat = await createChat.mutateAsync(text);
+        // Стартуем стрим сразу — но через новый chatId.
+        startStream(text, chat.id);
+        return;
+      }
+      startStream(text, chatId);
+    },
+    // startStream закрывается над settings, поэтому обязан быть в deps —
+    // иначе после смены chip'а handleSend будет использовать stale-функцию
+    // с устаревшим rag_mode и слать неправильные флаги на бэк.
+    [chatId, createChat, startStream],
   );
 
   const handleStop = React.useCallback(() => {

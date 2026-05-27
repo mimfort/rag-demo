@@ -111,8 +111,10 @@ export function MessageBubble({
     explain != null &&
     explain.rag_skipped === true &&
     !explain.routed;
-  const hasDetails =
-    role === "assistant" && explain != null && !isManualBypass;
+  // Кнопку «детали ответа» оставляем доступной и в bypass-режиме: пользователь
+  // всё равно хочет глянуть как ассистент думал (а с приходом LangGraph там
+  // будет видна траектория графа узлов).
+  const hasDetails = role === "assistant" && explain != null;
 
   return (
     <div className={cn("flex gap-3 group", role === "user" ? "flex-row-reverse" : "flex-row", isManualBypass && "mb-5")}>

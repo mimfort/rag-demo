@@ -47,7 +47,14 @@ const META: Record<
 
 export function RagModeChip({ value, onChange }: Props) {
   const [open, setOpen] = React.useState(false);
-  const cur = META[value];
+  // SSR совместимость: Zustand persist на сервере отдаёт default-значение,
+  // а после регидрации клиент читает реальный rag_mode из localStorage.
+  // Чтобы первый клиентский рендер совпал с серверным, показываем "auto"
+  // до монтирования, потом переключаемся на реальное value.
+  const [mounted, setMounted] = React.useState(false);
+  React.useEffect(() => setMounted(true), []);
+  const effective: RagMode = mounted ? value : "auto";
+  const cur = META[effective];
   const Cur = cur.Icon;
 
   return (
@@ -70,7 +77,7 @@ export function RagModeChip({ value, onChange }: Props) {
         </p>
         {(Object.keys(META) as RagMode[]).map((m) => {
           const Item = META[m].Icon;
-          const selected = m === value;
+          const selected = m === effective;
           return (
             <button
               key={m}
