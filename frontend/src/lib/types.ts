@@ -4,6 +4,7 @@
  */
 
 export type SearchMode = "vector" | "text" | "hybrid";
+export type RagMode = "auto" | "on" | "off";
 export type RouteIntent = "knowledge" | "chitchat" | "meta" | "other";
 
 export interface Chunk {
@@ -117,6 +118,7 @@ export interface RetrievalSettings {
   rewrite_n: number;
   auto_route: boolean;
   streaming: boolean;
+  rag_mode: RagMode;
 }
 
 export const DEFAULT_SETTINGS: RetrievalSettings = {
@@ -135,6 +137,7 @@ export const DEFAULT_SETTINGS: RetrievalSettings = {
   rewrite_n: 3,
   auto_route: true,
   streaming: true,
+  rag_mode: "auto",
 };
 
 /* ---------- Chats ---------- */
