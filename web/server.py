@@ -324,6 +324,11 @@ class ExplainOut(BaseModel):
     route_fallback: bool = False   # был ли fallback на knowledge
     # Если интент не knowledge — RAG-этапы пропущены.
     rag_skipped: bool = False
+    # Auto-fallback: router сказал knowledge, retrieve отработал, но top-1
+    # similarity ниже порога — вместо «в контексте нет информации» отвечаем
+    # из общей LLM-эрудиции. retrieve-данные (chunks/all_scores) остаются
+    # в explain для прозрачности в drawer'е.
+    auto_fallback: bool = False
     # ── query rewriting ────────────────────────────────────────────
     rewritten: bool = False             # реально ли сгенерировали >1 формулировку
     rewrite_status: str = "off"         # "off" | "rewritten" | "failed"
@@ -1090,6 +1095,50 @@ def _save_chat_messages(
     )
 
 
+# Порог уверенности reranker'а (sigmoid 0..1): ниже него считаем, что
+# модель НЕ нашла релевантного контекста и в Auto-режиме переключаемся
+# на общую LLM. Эмпирически на bge-reranker-v2-m3: релевантные чанки
+# дают 0.5-0.95, нерелевантные — почти 0. Запас выбран небольшой.
+AUTO_FALLBACK_RERANK_THRESHOLD = 0.1
+
+
+def _should_auto_fallback(
+    *,
+    auto_route: bool,
+    route_intent: str | None,
+    chunks: list[RetrievedChunk],
+    explain: ExplainOut,
+    rerank_on: bool,
+    min_similarity: float,
+) -> bool:
+    """
+    Решаем: в режиме Auto после retrieve — отвечать через RAG (контекст
+    есть) или фоллбэкнуться на общую LLM (контекста нет).
+
+    Сигнал зависит от того, был ли reranker:
+      - rerank ON  — смотрим максимум reranker_score (откалиброван 0..1).
+      - rerank OFF — смотрим максимум cosine по ВСЕЙ базе (all_scores).
+    Это надёжнее, чем top_similarity из chunks[0]: после rerank там может
+    оказаться чанк с низкой cosine (reranker переставил порядок).
+    """
+    if not auto_route or route_intent != "knowledge":
+        return False
+    if not chunks:
+        return True
+
+    if rerank_on:
+        max_rerank = max(
+            (c.reranker_score for c in chunks if c.reranker_score is not None),
+            default=0.0,
+        )
+        return max_rerank < AUTO_FALLBACK_RERANK_THRESHOLD
+
+    max_sim = max(
+        (s.similarity for s in explain.all_scores), default=0.0,
+    )
+    return max_sim < min_similarity
+
+
 def _empty_explain(**overrides) -> ExplainOut:
     """
     Минимальная заглушка для direct-answer-режима, чтобы UI не падал.
@@ -1187,6 +1236,49 @@ def ask(req: AskRequest) -> AskResponse:
             status_code=400,
             detail="В базе нет чанков. Запусти `python ingest.py`.",
         )
+
+    # 0c. Auto-fallback: router отправил в RAG (intent=knowledge), но ни
+    #     один чанк не получил достаточной уверенности. Сигнал зависит от
+    #     того, был ли rerank:
+    #       - rerank ON  → top.reranker_score (sigmoid-калиброван, 0..1);
+    #                       это правильный показатель «нашли ли релевантное».
+    #       - rerank OFF → max cosine по ВСЕЙ базе (all_scores); top из
+    #                       chunks ненадёжен (могут быть text-only).
+    #     На bge-m3 для русского cosine релевантного чанка часто 0.35-0.5
+    #     даже когда тема ровно в базе — поэтому полагаться только на cosine
+    #     рискованно.
+    should_fallback = _should_auto_fallback(
+        auto_route=req.auto_route,
+        route_intent=route_info.get("route_intent"),
+        chunks=chunks,
+        explain=explain,
+        rerank_on=req.rerank,
+        min_similarity=req.min_similarity,
+    )
+    if should_fallback:
+        history = (
+            _history_store.get_recent(req.chat_id, limit=8)
+            if req.chat_id and _history_store else []
+        )
+        answer = _generate_direct_answer(
+            req.query, history, intent="general", stream=False,
+        )
+        explain = explain.model_copy(update={
+            "rag_skipped": True,
+            "auto_fallback": True,
+        })
+        _save_chat_messages(
+            req.chat_id, req.query, answer,
+            chunks=[c.model_dump() for c in _to_chunk_out(chunks)],
+            explain=explain.model_dump(),
+        )
+        return AskResponse(
+            chunks=_to_chunk_out(chunks),
+            prompt="",
+            answer=answer,
+            explain=explain,
+        )
+
     # Промпт и ответ строим на расширенных чанках (с соседями, если был
     # expand_context). В UI отдаём оригинальные «центральные» чанки —
     # пользователь видит что именно retrieval нашёл, без раздувания.
@@ -1352,6 +1444,22 @@ def ask_stream(
         "chat_id": chat_id, **standalone_info, **route_info,
     })
 
+    # 0c. Auto-fallback (см. POST /api/ask): отвечаем из общей LLM если
+    #     уверенности retrieval'а не хватает.
+    should_fallback = _should_auto_fallback(
+        auto_route=auto_route,
+        route_intent=route_info.get("route_intent"),
+        chunks=chunks,
+        explain=explain,
+        rerank_on=rerank,
+        min_similarity=min_similarity,
+    )
+    if should_fallback:
+        explain = explain.model_copy(update={
+            "rag_skipped": True,
+            "auto_fallback": True,
+        })
+
     def event_source() -> Iterator[str]:
         # 1. Сначала отдаём «meta»: что нашли, промпт и explain-блок.
         #    Используем _to_chunk_out (тот же, что в POST /api/ask) — иначе
@@ -1359,7 +1467,11 @@ def ask_stream(
         #    В UI отдаём оригинальные центральные чанки, а в промпт —
         #    расширенные соседями (если включён expand_context).
         # Считаем промпт один раз — отдадим в meta И сохраним в БД для history.
-        prompt_text = build_user_prompt(effective_query, chunks_for_prompt)
+        # При auto-fallback prompt пустой: ответ не использует контекст.
+        prompt_text = (
+            "" if should_fallback
+            else build_user_prompt(effective_query, chunks_for_prompt)
+        )
         chunks_serializable = [c.model_dump() for c in _to_chunk_out(chunks)]
         explain_dict = explain.model_dump()
         meta_payload = {
@@ -1378,21 +1490,34 @@ def ask_stream(
             yield _sse_event("done", {})
             return
 
-        # 2. Стримим токены ответа. LLM получает расширенный контекст
-        #    и (если был history) standalone-переписанный запрос.
+        # 2. Стримим токены ответа. При auto-fallback — из общей LLM-эрудиции;
+        #    в обычном RAG-пути — с подмешанным контекстом.
         full_answer_parts: list[str] = []
-        for piece in _generator.generate_stream(effective_query, chunks_for_prompt):
+        if should_fallback:
+            history = (
+                _history_store.get_recent(chat_id, limit=8)
+                if chat_id and _history_store else []
+            )
+            token_iter = _generate_direct_answer(
+                effective_query, history, intent="general", stream=True,
+            )
+        else:
+            token_iter = _generator.generate_stream(
+                effective_query, chunks_for_prompt,
+            )
+        for piece in token_iter:
             full_answer_parts.append(piece)
             yield _sse_event("token", {"text": piece})
 
         # 3. Сохраняем сообщения в историю (если работаем в чате) с полным
-        #    pipeline-снимком. После refresh UI восстановит шаги.
+        #    pipeline-снимком. После refresh UI восстановит шаги. При
+        #    auto-fallback prompt не пишем (пустой).
         full_answer = "".join(full_answer_parts)
         _save_chat_messages(
             chat_id, query, full_answer,
             chunks=chunks_serializable,
             explain=explain_dict,
-            prompt=prompt_text,
+            prompt=prompt_text if prompt_text else None,
         )
 
         # 4. Сигнал конца.

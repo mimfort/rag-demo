@@ -103,6 +103,11 @@ export function MessageBubble({
   streaming,
 }: Props) {
   const [detailsOpen, setDetailsOpen] = React.useState(false);
+  // Auto-fallback: Auto-режим попробовал RAG, но top similarity оказалась
+  // ниже порога — ответ пришёл из общей LLM-эрудиции, retrieve-данные есть
+  // в drawer'е для прозрачности.
+  const isAutoFallback =
+    role === "assistant" && explain?.auto_fallback === true;
   // Условие «ручной bypass»: RAG был пропущен, но не из-за router'а
   // (router заполнил бы routed=true и route_intent). Если routed=false и
   // rag_skipped=true — значит пользователь явно выбрал режим Off.
@@ -117,7 +122,7 @@ export function MessageBubble({
   const hasDetails = role === "assistant" && explain != null;
 
   return (
-    <div className={cn("flex gap-3 group", role === "user" ? "flex-row-reverse" : "flex-row", isManualBypass && "mb-5")}>
+    <div className={cn("flex gap-3 group", role === "user" ? "flex-row-reverse" : "flex-row", (isManualBypass || isAutoFallback) && "mb-5")}>
       <div
         className={cn(
           "h-7 w-7 shrink-0 rounded-full flex items-center justify-center border",
@@ -206,6 +211,14 @@ export function MessageBubble({
               <span className="inline-flex items-center gap-1 rounded-full border border-border bg-card px-2 py-0.5">
                 <span aria-hidden>○</span>
                 RAG не использовался — режим обычного чата
+              </span>
+            </div>
+          )}
+          {isAutoFallback && (
+            <div className="absolute -bottom-5 left-0 text-[10px] text-amber-500/90">
+              <span className="inline-flex items-center gap-1 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5">
+                <span aria-hidden>◐</span>
+                Ответ не из базы — RAG не нашёл достаточно релевантного контекста
               </span>
             </div>
           )}

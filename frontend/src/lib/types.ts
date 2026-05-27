@@ -91,6 +91,9 @@ export interface Explain {
   route_ms?: number | null;
   route_fallback?: boolean;
   rag_skipped?: boolean;
+  // auto_fallback: Auto-режим — router сказал knowledge, retrieve отработал,
+  // но top similarity ниже порога → ответ из общей LLM-эрудиции.
+  auto_fallback?: boolean;
 }
 
 export interface AskResponse {
