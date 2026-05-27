@@ -1231,12 +1231,6 @@ def ask(req: AskRequest) -> AskResponse:
         **standalone_info,
         **route_info,  # router-инфо (пусто если auto_route выключен)
     })
-    if not chunks:
-        raise HTTPException(
-            status_code=400,
-            detail="В базе нет чанков. Запусти `python ingest.py`.",
-        )
-
     # 0c. Auto-fallback: router отправил в RAG (intent=knowledge), но ни
     #     один чанк не получил достаточной уверенности. Сигнал зависит от
     #     того, был ли rerank:
@@ -1277,6 +1271,14 @@ def ask(req: AskRequest) -> AskResponse:
             prompt="",
             answer=answer,
             explain=explain,
+        )
+
+    # On-mode (или Auto при `chunks_in_db==0`): если запас чанков пуст —
+    # это уже не fallback-кейс, отдаём явную ошибку про ingest.
+    if not chunks:
+        raise HTTPException(
+            status_code=400,
+            detail="В базе нет чанков. Запусти `python ingest.py`.",
         )
 
     # Промпт и ответ строим на расширенных чанках (с соседями, если был
@@ -1488,8 +1490,10 @@ def ask_stream(
         }
         yield _sse_event("meta", meta_payload)
 
-        # Если контекста нет — заканчиваем, не дёргая LLM.
-        if not chunks:
+        # Если контекста нет — заканчиваем (только в On-режиме). В Auto
+        # пустые chunks означают «reranker всё отрезал» → нам нужен
+        # fallback на общую LLM, обработка ниже.
+        if not chunks and not should_fallback:
             yield _sse_event(
                 "token",
                 {"text": "В базе нет чанков. Запусти `python ingest.py`."},
