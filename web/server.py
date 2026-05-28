@@ -2032,3 +2032,36 @@ async def agent_ask(req: AgentAskRequest) -> AgentAskResponse:
 @app.get("/api/agent/messages", response_model=list[AgentMessageOut])
 def agent_messages(limit: int = 200) -> list[AgentMessageOut]:
     return _list_agent_messages(limit=limit)
+
+
+@app.get("/api/agent/ask/stream")
+async def agent_ask_stream(query: str) -> StreamingResponse:
+    """SSE-стрим events во время прогона графа. По завершении сохраняет
+    user+assistant пару в БД (даже если клиент успел отсоединиться —
+    через try/finally в event_source, по тому же паттерну что в RAG-стриме).
+    """
+    if not query.strip():
+        raise HTTPException(status_code=400, detail="query пуст")
+
+    _save_agent_message("user", query, None)
+
+    async def event_source():
+        full_trace: list[dict] = []
+        final_answer = ""
+        try:
+            async for event in run_stream(query):
+                full_trace.append(event)
+                if event["type"] == "final_answer":
+                    final_answer = event["data"]["text"]
+                yield _sse_event(event["type"], event["data"])
+        finally:
+            # Сохраняем даже при дисконнекте клиента — иначе ответ
+            # «уехал» в UI, но в БД его нет.
+            if full_trace:
+                _save_agent_message("assistant", final_answer, full_trace)
+
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
