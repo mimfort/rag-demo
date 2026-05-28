@@ -24,6 +24,7 @@ web/server.py — простой FastAPI-сервер поверх нашего 
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import time
@@ -2016,12 +2017,25 @@ def _list_agent_messages(limit: int = 200) -> list[AgentMessageOut]:
     ]
 
 
+async def _save_agent_message_async(role: str, content: str, trace: list | None) -> int:
+    """Async-обёртка над sync psycopg-вызовом. psycopg-коннект — синхронный
+    (autocommit=True от VectorStore), а вызывается из async-эндпоинта —
+    без to_thread INSERT блокирует event loop на время round-trip'а к Postgres."""
+    return await asyncio.to_thread(_save_agent_message, role, content, trace)
+
+
 @app.post("/api/agent/ask", response_model=AgentAskResponse)
 async def agent_ask(req: AgentAskRequest) -> AgentAskResponse:
     """Non-streaming прогон агента. Сохраняет user+assistant пару в БД."""
-    _save_agent_message("user", req.query, None)
-    result = await run_collect(req.query)
-    _save_agent_message("assistant", result.answer, result.trace)
+    await _save_agent_message_async("user", req.query, None)
+    try:
+        result = await run_collect(req.query)
+    except Exception as exc:
+        # Защита от orphan'а: user-сообщение уже в БД, нужно записать
+        # и assistant-плейсхолдер чтобы история не висела «полузаписанной».
+        await _save_agent_message_async("assistant", f"Внутренняя ошибка: {exc}", [])
+        raise
+    await _save_agent_message_async("assistant", result.answer, result.trace)
     return AgentAskResponse(
         answer=result.answer,
         trace=[TraceEvent(**e) for e in result.trace],
@@ -2043,7 +2057,7 @@ async def agent_ask_stream(query: str) -> StreamingResponse:
     if not query.strip():
         raise HTTPException(status_code=400, detail="query пуст")
 
-    _save_agent_message("user", query, None)
+    await _save_agent_message_async("user", query, None)
 
     async def event_source():
         full_trace: list[dict] = []
@@ -2058,7 +2072,9 @@ async def agent_ask_stream(query: str) -> StreamingResponse:
             # Сохраняем даже при дисконнекте клиента — иначе ответ
             # «уехал» в UI, но в БД его нет.
             if full_trace:
-                _save_agent_message("assistant", final_answer, full_trace)
+                await _save_agent_message_async(
+                    "assistant", final_answer, full_trace,
+                )
 
     return StreamingResponse(
         event_source(),

@@ -41,25 +41,41 @@ def _event(type_: str, data: dict) -> dict:
     return {"type": type_, "timestamp": _now_iso(), "data": data}
 
 
+# Модульный singleton — graph stateless (state per-invocation в astream),
+# а build_graph() тяжёлый: создаёт ChatOpenAI, биндит tools, компилирует
+# StateGraph. Пересоздавать на каждый запрос — лишний оверхед.
+_graph = None
+
+
+def _get_graph():
+    global _graph
+    if _graph is None:
+        _graph = build_graph()
+    return _graph
+
+
 async def _astream_events(query: str) -> AsyncIterator[dict]:
     """Внутренний async-генератор: yield'ит dict-events по мере
     выполнения графа. НЕ форматирует SSE — это делает Web-слой."""
-    graph = build_graph()
+    graph = _get_graph()
     iterations = 0
+    stream = graph.astream(
+        {"messages": [HumanMessage(query)]},
+        stream_mode="updates",
+    )
 
     try:
         # stream_mode="updates" даёт {node_name: state_delta} после каждого узла.
-        async for update in graph.astream(
-            {"messages": [HumanMessage(query)]},
-            stream_mode="updates",
-        ):
-            iterations += 1
-            if iterations > MAX_ITER:
+        async for update in stream:
+            # Guard ДО обработки очередного апдейта — иначе MAX_ITER+1-я
+            # итерация уже выполнилась внутри графа когда мы её ловим.
+            if iterations >= MAX_ITER:
                 yield _event("error", {
                     "code": "max_iter",
                     "message": f"Превышен лимит итераций ({MAX_ITER})",
                 })
                 return
+            iterations += 1
 
             for node_name, delta in update.items():
                 yield _event("node_start", {"node": node_name})
