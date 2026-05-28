@@ -13,10 +13,29 @@ ToolNode-совместимый callable. Сигнатуру и docstring decora
 
 from __future__ import annotations
 
+from datetime import date as date_cls
+from urllib.parse import quote
+
 import httpx
 from langchain_core.tools import tool
 
 from agent.config import HTTP_TIMEOUT_SEC, agent_settings
+
+
+def _validate_date(value: str) -> str | None:
+    """Возвращает дату как YYYY-MM-DD если валидна, иначе None.
+
+    Защита от SSRF/path-injection: `date` приходит из tool_call'а LLM, и
+    без проверки попадёт в URL-интерполяцию. Маленькая модель теоретически
+    может сгенерировать аргумент вроде `../../admin`. fromisoformat()
+    раскладывает только настоящие ISO-даты — невалидные кидают ValueError.
+    Дополнительно квотируем сегмент для defense-in-depth.
+    """
+    try:
+        parsed = date_cls.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
+    return parsed.isoformat()
 
 
 # Условия в weather-API, которые мы считаем «солнечно». На реальной
@@ -72,18 +91,21 @@ async def get_weather(date: str) -> dict:
     """Получить прогноз погоды на конкретную дату в формате YYYY-MM-DD.
 
     Возвращает: {date, temperature_c, condition, sunny: bool, raw}
-    либо {error: "..."} при сетевой/HTTP ошибке.
+    либо {error: "..."} при сетевой/HTTP ошибке или невалидной дате.
     """
-    url = f"{agent_settings.skkrondo_base_url}/weather/weather/{date}"
+    valid = _validate_date(date)
+    if valid is None:
+        return {"error": "invalid date: expected YYYY-MM-DD", "date": date}
+    url = f"{agent_settings.skkrondo_base_url}/weather/weather/{quote(valid, safe='')}"
     try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SEC) as client:
             r = await client.get(url)
             r.raise_for_status()
             raw = r.json()
     except Exception as exc:
-        return {"error": f"{type(exc).__name__}: {exc}", "date": date}
+        return {"error": f"{type(exc).__name__}: {exc}", "date": valid}
     return {
-        "date": date,
+        "date": valid,
         "temperature_c": raw.get("temperature") or raw.get("temp"),
         "condition": raw.get("condition") or raw.get("description"),
         "sunny": _classify_sunny(raw),
@@ -96,19 +118,22 @@ async def get_courts_availability(date: str) -> dict:
     """Получить занятые слоты кортов на конкретную дату YYYY-MM-DD.
 
     Возвращает: {date, reservations: [...], summary: "текст"} либо
-    {error: "..."} при сетевой/HTTP ошибке.
+    {error: "..."} при сетевой/HTTP ошибке или невалидной дате.
     """
-    url = f"{agent_settings.skkrondo_base_url}/court_reservations/all/{date}"
+    valid = _validate_date(date)
+    if valid is None:
+        return {"error": "invalid date: expected YYYY-MM-DD", "date": date}
+    url = f"{agent_settings.skkrondo_base_url}/court_reservations/all/{quote(valid, safe='')}"
     try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SEC) as client:
             r = await client.get(url)
             r.raise_for_status()
             raw = r.json()
     except Exception as exc:
-        return {"error": f"{type(exc).__name__}: {exc}", "date": date}
+        return {"error": f"{type(exc).__name__}: {exc}", "date": valid}
     reservations = _extract_reservations(raw)
     return {
-        "date": date,
+        "date": valid,
         "reservations": reservations,
         "summary": _summarize_courts(reservations),
     }
