@@ -55,6 +55,7 @@ from rag.reranker import CrossEncoderReranker
 from rag.rewriter import QueryRewriter
 from rag.router import QueryRouter, RouteDecision
 from rag.vector_store import RetrievedChunk, ScoredChunk, VectorStore, RRF_K
+from agent.runner import run_collect, run_stream
 from evals.metrics import ChunkKey, QueryMetrics, aggregate, score_query
 from evals.runner import (
     GoldenItem,
@@ -1944,3 +1945,90 @@ def index() -> FileResponse:
         _STATIC_DIR / "index.html",
         headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
     )
+
+
+# ============================================================================
+# Agent (Spec 1: LangGraph-based skkrondo concierge)
+# ============================================================================
+
+class AgentAskRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=2000)
+
+
+class TraceEvent(BaseModel):
+    type: str
+    timestamp: str
+    data: dict
+
+
+class AgentAskResponse(BaseModel):
+    answer: str
+    trace: list[TraceEvent]
+    iterations: int
+
+
+class AgentMessageOut(BaseModel):
+    id: int
+    role: str
+    content: str
+    trace: list[TraceEvent] | None = None
+    created_at: str
+
+
+def _save_agent_message(role: str, content: str, trace: list | None) -> int:
+    """Сохраняет один agent_message в БД. Возвращает id вставленной строки."""
+    assert _store is not None
+    with _store._conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO agent_messages (role, content, trace)
+            VALUES (%s, %s, %s::jsonb)
+            RETURNING id
+            """,
+            (role, content, json.dumps(trace) if trace is not None else None),
+        )
+        row = cur.fetchone()
+    return row[0]
+
+
+def _list_agent_messages(limit: int = 200) -> list[AgentMessageOut]:
+    assert _store is not None
+    with _store._conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, role, content, trace, created_at
+            FROM agent_messages
+            ORDER BY id ASC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        rows = cur.fetchall()
+    return [
+        AgentMessageOut(
+            id=r[0],
+            role=r[1],
+            content=r[2],
+            trace=r[3] if r[3] is not None else None,
+            created_at=r[4].isoformat(),
+        )
+        for r in rows
+    ]
+
+
+@app.post("/api/agent/ask", response_model=AgentAskResponse)
+async def agent_ask(req: AgentAskRequest) -> AgentAskResponse:
+    """Non-streaming прогон агента. Сохраняет user+assistant пару в БД."""
+    _save_agent_message("user", req.query, None)
+    result = await run_collect(req.query)
+    _save_agent_message("assistant", result.answer, result.trace)
+    return AgentAskResponse(
+        answer=result.answer,
+        trace=[TraceEvent(**e) for e in result.trace],
+        iterations=result.iterations,
+    )
+
+
+@app.get("/api/agent/messages", response_model=list[AgentMessageOut])
+def agent_messages(limit: int = 200) -> list[AgentMessageOut]:
+    return _list_agent_messages(limit=limit)
