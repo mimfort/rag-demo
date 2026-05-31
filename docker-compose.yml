@@ -1,37 +1,86 @@
-# Поднимаем PostgreSQL с уже установленным расширением pgvector.
-# Образ pgvector/pgvector — это обычный postgres плюс скомпилированное расширение,
-# поэтому ничего отдельно собирать не нужно: пришёл, поднял, работает.
+# Полный стек одним `docker compose up`:
+#   postgres  — pgvector + схема (init.sql / init_agent.sql)
+#   backend   — FastAPI (RAG + LangGraph-агент) на :8000
+#   frontend  — Next.js (production build) на :3000
+#
+# LM Studio предполагается ЗАПУЩЕННОЙ НА ХОСТЕ (порт 1234). Из контейнера
+# хост доступен как host.docker.internal на macOS/Windows; для Linux —
+# секция extra_hosts с host-gateway (см. backend.extra_hosts ниже).
+
 services:
   postgres:
     image: pgvector/pgvector:pg16
     container_name: rag_postgres
     restart: unless-stopped
     environment:
-      # Эти переменные читает официальный образ postgres при первом запуске:
-      # он создаст пользователя, пароль и БД с такими именами.
       POSTGRES_USER: rag
       POSTGRES_PASSWORD: rag
       POSTGRES_DB: rag
     ports:
-      # Пробрасываем порт 5433 на хосте → 5432 в контейнере.
-      # 5433 (а не 5432) чтобы не конфликтовать с системным Postgres,
-      # если он уже занимает 5432. При подключении psql-ом с хоста:
-      #   psql -h localhost -p 5433 -U rag -d rag
+      # На хосте — 5433, чтобы не конфликтовать с системным Postgres.
+      # Внутри docker-сети backend обращается по имени `postgres:5432`.
       - "5433:5432"
     volumes:
-      # Том для постоянного хранения данных — при docker compose down -v
-      # этот том можно удалить и начать с чистой БД.
       - rag_pgdata:/var/lib/postgresql/data
-      # Скрипты из /docker-entrypoint-initdb.d/ выполняются только при ПЕРВОМ
-      # старте контейнера (когда тома ещё нет). Здесь мы создаём расширение
-      # vector и таблицу chunks.
-      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      # Оба init-скрипта выполняются при первом старте контейнера.
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+      - ./db/init_agent.sql:/docker-entrypoint-initdb.d/02_init_agent.sql:ro
     healthcheck:
-      # Простая проверка живости: pg_isready возвращает 0 если БД готова.
       test: ["CMD-SHELL", "pg_isready -U rag -d rag"]
       interval: 5s
       timeout: 5s
       retries: 5
 
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    container_name: rag_backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # env_file подмешивает значения из .env (LM_STUDIO_API_KEY, CHAT_MODEL и пр).
+    # Параметры подключения к БД и LM Studio переопределяем ниже под docker-сеть.
+    env_file:
+      - .env
+    environment:
+      # Внутри docker-сети Postgres доступен по имени сервиса, не localhost.
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      # LM Studio на хосте → host.docker.internal (см. extra_hosts для Linux).
+      LM_STUDIO_BASE_URL: http://host.docker.internal:1234/v1
+    ports:
+      - "8000:8000"
+    volumes:
+      # Кэш HuggingFace — чтобы reranker (~570 МБ) не перекачивался при
+      # пересборке/recreate контейнера.
+      - hf_cache:/root/.cache/huggingface
+      # docs/ монтируем read-only — можно подменять корпус на хосте и
+      # перезапускать `python ingest.py` (см. ниже команду внутри контейнера).
+      - ./docs:/app/docs:ro
+    extra_hosts:
+      # На Linux host.docker.internal по умолчанию не резолвится — этот
+      # маппинг чинит. На macOS/Windows работает и без него, но лишним
+      # не будет.
+      - "host.docker.internal:host-gateway"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: ../docker/Dockerfile.frontend
+      args:
+        # Браузер ходит на backend напрямую (мимо Next.js dev-proxy —
+        # иначе SSE буферизуется). Адрес — с точки зрения БРАУЗЕРА:
+        # localhost:8000, потому что backend пробрасывает порт 8000 на хост.
+        NEXT_PUBLIC_API_BASE_URL: http://localhost:8000
+    container_name: rag_frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "3000:3000"
+
 volumes:
   rag_pgdata:
+  hf_cache:

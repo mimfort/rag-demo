@@ -88,15 +88,6 @@ export function SettingsDrawer({ open, onOpenChange, chatId }: Props) {
                   onCheckedChange={(v) => update({ streaming: v })}
                 />
               </Row>
-              <Row
-                label="auto-route"
-                hint="LLM решает нужен ли RAG (chitchat / meta / other → без поиска)"
-              >
-                <Switch
-                  checked={settings.auto_route}
-                  onCheckedChange={(v) => update({ auto_route: v })}
-                />
-              </Row>
             </Section>
 
             {/* Retrieval */}

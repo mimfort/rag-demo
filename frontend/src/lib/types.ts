@@ -4,6 +4,7 @@
  */
 
 export type SearchMode = "vector" | "text" | "hybrid";
+export type RagMode = "auto" | "on" | "off";
 export type RouteIntent = "knowledge" | "chitchat" | "meta" | "other";
 
 export interface Chunk {
@@ -90,6 +91,9 @@ export interface Explain {
   route_ms?: number | null;
   route_fallback?: boolean;
   rag_skipped?: boolean;
+  // auto_fallback: Auto-режим — router сказал knowledge, retrieve отработал,
+  // но top similarity ниже порога → ответ из общей LLM-эрудиции.
+  auto_fallback?: boolean;
 }
 
 export interface AskResponse {
@@ -117,6 +121,7 @@ export interface RetrievalSettings {
   rewrite_n: number;
   auto_route: boolean;
   streaming: boolean;
+  rag_mode: RagMode;
 }
 
 export const DEFAULT_SETTINGS: RetrievalSettings = {
@@ -135,6 +140,7 @@ export const DEFAULT_SETTINGS: RetrievalSettings = {
   rewrite_n: 3,
   auto_route: true,
   streaming: true,
+  rag_mode: "auto",
 };
 
 /* ---------- Chats ---------- */

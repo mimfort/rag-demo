@@ -64,6 +64,21 @@ async function json<T>(input: RequestInfo, init?: RequestInit): Promise<T> {
   return res.json();
 }
 
+/**
+ * Маппинг ragMode из UI в два независимых флага бэка.
+ *  - "auto": router работает как обычно;
+ *  - "on": router выключен → RAG всегда;
+ *  - "off": bypass_rag=true → бэк пропускает retrieve.
+ */
+function ragModeToFlags(mode: RetrievalSettings["rag_mode"]) {
+  switch (mode) {
+    case "on":  return { auto_route: false, bypass_rag: false };
+    case "off": return { auto_route: false, bypass_rag: true };
+    case "auto":
+    default:    return { auto_route: true,  bypass_rag: false };
+  }
+}
+
 /* -------- Health -------- */
 export const api = {
   health: () => json<{ ok: boolean; chunks_in_db: number }>(api_url("/api/health")),
@@ -145,7 +160,7 @@ export const api = {
         expand_radius: settings.expand_radius,
         rewrite: settings.rewrite,
         rewrite_n: settings.rewrite_n,
-        auto_route: settings.auto_route,
+        ...ragModeToFlags(settings.rag_mode),
         chat_id: chatId ?? null,
       }),
     }),
@@ -174,7 +189,8 @@ export const api = {
       expand_radius: String(settings.expand_radius),
       rewrite: String(settings.rewrite),
       rewrite_n: String(settings.rewrite_n),
-      auto_route: String(settings.auto_route),
+      auto_route: String(ragModeToFlags(settings.rag_mode).auto_route),
+      bypass_rag: String(ragModeToFlags(settings.rag_mode).bypass_rag),
     });
     if (chatId) params.set("chat_id", chatId);
     return api_url(`/api/ask/stream?${params.toString()}`);

@@ -37,3 +37,11 @@ python-multipart>=0.0.20,<1.0
 # Модель BAAI/bge-reranker-v2-m3 (~570 МБ) скачается при первой
 # инициализации в ~/.cache/huggingface/hub.
 sentence-transformers>=3.0,<5.0
+
+# --- LangGraph-агент (Spec 1: skkrondo concierge) ---
+# Граф с узлами, состояниями и conditional edges.
+langgraph>=0.2,<1.0
+
+# ChatOpenAI-обёртка для LM Studio (он OpenAI-compat). langchain-core
+# придёт транзитивно — даст BaseMessage, ToolMessage, @tool decorator.
+langchain-openai>=0.2,<1.0

@@ -24,6 +24,7 @@ web/server.py — простой FastAPI-сервер поверх нашего 
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import time
@@ -55,6 +56,7 @@ from rag.reranker import CrossEncoderReranker
 from rag.rewriter import QueryRewriter
 from rag.router import QueryRouter, RouteDecision
 from rag.vector_store import RetrievedChunk, ScoredChunk, VectorStore, RRF_K
+from agent.runner import run_collect, run_stream
 from evals.metrics import ChunkKey, QueryMetrics, aggregate, score_query
 from evals.runner import (
     GoldenItem,
@@ -236,6 +238,10 @@ class AskRequest(BaseModel):
     # "knowledge" — отвечаем напрямую без RAG. Экономит время на chitchat
     # и meta-вопросах.
     auto_route: bool = False
+    # Принудительный bypass RAG: пользователь явно выбрал режим без
+    # retrieval. В отличие от auto_route, тут не запускается классификатор —
+    # сразу идём в _generate_direct_answer с intent="general".
+    bypass_rag: bool = False
 
 
 class ChunkOut(BaseModel):
@@ -320,6 +326,11 @@ class ExplainOut(BaseModel):
     route_fallback: bool = False   # был ли fallback на knowledge
     # Если интент не knowledge — RAG-этапы пропущены.
     rag_skipped: bool = False
+    # Auto-fallback: router сказал knowledge, retrieve отработал, но top-1
+    # similarity ниже порога — вместо «в контексте нет информации» отвечаем
+    # из общей LLM-эрудиции. retrieve-данные (chunks/all_scores) остаются
+    # в explain для прозрачности в drawer'е.
+    auto_fallback: bool = False
     # ── query rewriting ────────────────────────────────────────────
     rewritten: bool = False             # реально ли сгенерировали >1 формулировку
     rewrite_status: str = "off"         # "off" | "rewritten" | "failed"
@@ -912,6 +923,13 @@ _OTHER_SYSTEM = (
     "у тебя есть только техническая документация. Не выдумывай ответ."
 )
 
+_GENERAL_SYSTEM = (
+    "Ты — полезный ассистент. Отвечай по делу и кратко. Если пользователь "
+    "просит помочь с задачей, для которой пригодилась бы база знаний — "
+    "напомни, что в чате есть переключатель режима RAG и его можно "
+    "включить или поставить в Auto."
+)
+
 
 def _generate_direct_answer(
     query: str,
@@ -932,13 +950,17 @@ def _generate_direct_answer(
         system = _META_SYSTEM
     elif intent == "other":
         system = _OTHER_SYSTEM
+    elif intent == "general":
+        system = _GENERAL_SYSTEM
     else:
         # Шафтовая защита: пришёл не-поддерживаемый intent — отвечаем нейтрально.
         system = _CHITCHAT_SYSTEM
 
     # Для meta даём явную историю в user-промпте, иначе LLM не сможет
-    # сослаться на «предыдущие сообщения».
-    if intent == "meta" and history:
+    # сослаться на «предыдущие сообщения». Для general — тоже подмешиваем
+    # историю: пользователь явно выбрал режим без RAG, но LLM лучше
+    # отвечает с памятью предыдущих реплик.
+    if intent in ("meta", "general") and history:
         hist_block = "\n".join(
             f"{m.role}: {m.content}" for m in history
         )
@@ -1075,6 +1097,50 @@ def _save_chat_messages(
     )
 
 
+# Порог уверенности reranker'а (sigmoid 0..1): ниже него считаем, что
+# модель НЕ нашла релевантного контекста и в Auto-режиме переключаемся
+# на общую LLM. Эмпирически на bge-reranker-v2-m3: релевантные чанки
+# дают 0.5-0.95, нерелевантные — почти 0. Запас выбран небольшой.
+AUTO_FALLBACK_RERANK_THRESHOLD = 0.1
+
+
+def _should_auto_fallback(
+    *,
+    auto_route: bool,
+    route_intent: str | None,
+    chunks: list[RetrievedChunk],
+    explain: ExplainOut,
+    rerank_on: bool,
+    min_similarity: float,
+) -> bool:
+    """
+    Решаем: в режиме Auto после retrieve — отвечать через RAG (контекст
+    есть) или фоллбэкнуться на общую LLM (контекста нет).
+
+    Сигнал зависит от того, был ли reranker:
+      - rerank ON  — смотрим максимум reranker_score (откалиброван 0..1).
+      - rerank OFF — смотрим максимум cosine по ВСЕЙ базе (all_scores).
+    Это надёжнее, чем top_similarity из chunks[0]: после rerank там может
+    оказаться чанк с низкой cosine (reranker переставил порядок).
+    """
+    if not auto_route or route_intent != "knowledge":
+        return False
+    if not chunks:
+        return True
+
+    if rerank_on:
+        max_rerank = max(
+            (c.reranker_score for c in chunks if c.reranker_score is not None),
+            default=0.0,
+        )
+        return max_rerank < AUTO_FALLBACK_RERANK_THRESHOLD
+
+    max_sim = max(
+        (s.similarity for s in explain.all_scores), default=0.0,
+    )
+    return max_sim < min_similarity
+
+
 def _empty_explain(**overrides) -> ExplainOut:
     """
     Минимальная заглушка для direct-answer-режима, чтобы UI не падал.
@@ -1103,6 +1169,24 @@ def _empty_explain(**overrides) -> ExplainOut:
 def ask(req: AskRequest) -> AskResponse:
     """Обычный (нестриминговый) RAG-запрос."""
     assert _generator is not None  # для тайп-чекера
+
+    # 0. Bypass RAG: пользователь явно выбрал режим без retrieve.
+    if req.bypass_rag:
+        history = (
+            _history_store.get_recent(req.chat_id, limit=8)
+            if req.chat_id and _history_store else []
+        )
+        answer = _generate_direct_answer(
+            req.query, history, intent="general", stream=False,
+        )
+        explain = _empty_explain(chat_id=req.chat_id)
+        _save_chat_messages(
+            req.chat_id, req.query, answer,
+            explain=explain.model_dump(),
+        )
+        return AskResponse(
+            chunks=[], prompt="", answer=answer, explain=explain,
+        )
 
     # 0a. Router: классифицируем intent. Если включён и intent != knowledge —
     #     пропускаем RAG, отвечаем напрямую.
@@ -1149,11 +1233,56 @@ def ask(req: AskRequest) -> AskResponse:
         **standalone_info,
         **route_info,  # router-инфо (пусто если auto_route выключен)
     })
+    # 0c. Auto-fallback: router отправил в RAG (intent=knowledge), но ни
+    #     один чанк не получил достаточной уверенности. Сигнал зависит от
+    #     того, был ли rerank:
+    #       - rerank ON  → top.reranker_score (sigmoid-калиброван, 0..1);
+    #                       это правильный показатель «нашли ли релевантное».
+    #       - rerank OFF → max cosine по ВСЕЙ базе (all_scores); top из
+    #                       chunks ненадёжен (могут быть text-only).
+    #     На bge-m3 для русского cosine релевантного чанка часто 0.35-0.5
+    #     даже когда тема ровно в базе — поэтому полагаться только на cosine
+    #     рискованно.
+    should_fallback = _should_auto_fallback(
+        auto_route=req.auto_route,
+        route_intent=route_info.get("route_intent"),
+        chunks=chunks,
+        explain=explain,
+        rerank_on=req.rerank,
+        min_similarity=req.min_similarity,
+    )
+    if should_fallback:
+        history = (
+            _history_store.get_recent(req.chat_id, limit=8)
+            if req.chat_id and _history_store else []
+        )
+        answer = _generate_direct_answer(
+            req.query, history, intent="general", stream=False,
+        )
+        explain = explain.model_copy(update={
+            "rag_skipped": True,
+            "auto_fallback": True,
+        })
+        _save_chat_messages(
+            req.chat_id, req.query, answer,
+            chunks=[c.model_dump() for c in _to_chunk_out(chunks)],
+            explain=explain.model_dump(),
+        )
+        return AskResponse(
+            chunks=_to_chunk_out(chunks),
+            prompt="",
+            answer=answer,
+            explain=explain,
+        )
+
+    # On-mode (или Auto при `chunks_in_db==0`): если запас чанков пуст —
+    # это уже не fallback-кейс, отдаём явную ошибку про ingest.
     if not chunks:
         raise HTTPException(
             status_code=400,
             detail="В базе нет чанков. Запусти `python ingest.py`.",
         )
+
     # Промпт и ответ строим на расширенных чанках (с соседями, если был
     # expand_context). В UI отдаём оригинальные «центральные» чанки —
     # пользователь видит что именно retrieval нашёл, без раздувания.
@@ -1216,6 +1345,7 @@ def ask_stream(
     rewrite_n: int = 3,
     chat_id: str | None = None,
     auto_route: bool = False,
+    bypass_rag: bool = False,
 ) -> StreamingResponse:
     """
     Streaming-версия. Шлёт три типа событий:
@@ -1229,6 +1359,42 @@ def ask_stream(
 
     if not query.strip():
         raise HTTPException(status_code=400, detail="query пуст")
+
+    # 0. Bypass RAG: пользователь явно выбрал режим без retrieve.
+    if bypass_rag:
+        history = (
+            _history_store.get_recent(chat_id, limit=8)
+            if chat_id and _history_store else []
+        )
+        explain = _empty_explain(chat_id=chat_id)
+
+        def bypass_event_source() -> Iterator[str]:
+            yield _sse_event("meta", {
+                "chunks": [],
+                "prompt": "",
+                "explain": explain.model_dump(),
+            })
+            full: list[str] = []
+            try:
+                for piece in _generate_direct_answer(
+                    query, history, intent="general", stream=True,
+                ):
+                    full.append(piece)
+                    yield _sse_event("token", {"text": piece})
+            finally:
+                # Сохраняем даже при дисконнекте — иначе ответ уехал, но в БД его нет.
+                if full:
+                    _save_chat_messages(
+                        chat_id, query, "".join(full),
+                        explain=explain.model_dump(),
+                    )
+            yield _sse_event("done", {})
+
+        return StreamingResponse(
+            bypass_event_source(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     # 0a. Router: классифицируем intent. Если включён и intent != knowledge —
     #     стримим прямой ответ без retrieve-этапа.
@@ -1253,16 +1419,19 @@ def ask_stream(
                 "prompt": "",
                 "explain": explain.model_dump(),
             })
-            full = []
-            for piece in _generate_direct_answer(
-                query, history, direct_intent, stream=True,
-            ):
-                full.append(piece)
-                yield _sse_event("token", {"text": piece})
-            _save_chat_messages(
-                chat_id, query, "".join(full),
-                explain=explain.model_dump(),
-            )
+            full: list[str] = []
+            try:
+                for piece in _generate_direct_answer(
+                    query, history, direct_intent, stream=True,
+                ):
+                    full.append(piece)
+                    yield _sse_event("token", {"text": piece})
+            finally:
+                if full:
+                    _save_chat_messages(
+                        chat_id, query, "".join(full),
+                        explain=explain.model_dump(),
+                    )
             yield _sse_event("done", {})
 
         return StreamingResponse(
@@ -1286,6 +1455,22 @@ def ask_stream(
         "chat_id": chat_id, **standalone_info, **route_info,
     })
 
+    # 0c. Auto-fallback (см. POST /api/ask): отвечаем из общей LLM если
+    #     уверенности retrieval'а не хватает.
+    should_fallback = _should_auto_fallback(
+        auto_route=auto_route,
+        route_intent=route_info.get("route_intent"),
+        chunks=chunks,
+        explain=explain,
+        rerank_on=rerank,
+        min_similarity=min_similarity,
+    )
+    if should_fallback:
+        explain = explain.model_copy(update={
+            "rag_skipped": True,
+            "auto_fallback": True,
+        })
+
     def event_source() -> Iterator[str]:
         # 1. Сначала отдаём «meta»: что нашли, промпт и explain-блок.
         #    Используем _to_chunk_out (тот же, что в POST /api/ask) — иначе
@@ -1293,7 +1478,11 @@ def ask_stream(
         #    В UI отдаём оригинальные центральные чанки, а в промпт —
         #    расширенные соседями (если включён expand_context).
         # Считаем промпт один раз — отдадим в meta И сохраним в БД для history.
-        prompt_text = build_user_prompt(effective_query, chunks_for_prompt)
+        # При auto-fallback prompt пустой: ответ не использует контекст.
+        prompt_text = (
+            "" if should_fallback
+            else build_user_prompt(effective_query, chunks_for_prompt)
+        )
         chunks_serializable = [c.model_dump() for c in _to_chunk_out(chunks)]
         explain_dict = explain.model_dump()
         meta_payload = {
@@ -1303,8 +1492,10 @@ def ask_stream(
         }
         yield _sse_event("meta", meta_payload)
 
-        # Если контекста нет — заканчиваем, не дёргая LLM.
-        if not chunks:
+        # Если контекста нет — заканчиваем (только в On-режиме). В Auto
+        # пустые chunks означают «reranker всё отрезал» → нам нужен
+        # fallback на общую LLM, обработка ниже.
+        if not chunks and not should_fallback:
             yield _sse_event(
                 "token",
                 {"text": "В базе нет чанков. Запусти `python ingest.py`."},
@@ -1312,22 +1503,37 @@ def ask_stream(
             yield _sse_event("done", {})
             return
 
-        # 2. Стримим токены ответа. LLM получает расширенный контекст
-        #    и (если был history) standalone-переписанный запрос.
+        # 2. Стримим токены ответа. При auto-fallback — из общей LLM-эрудиции;
+        #    в обычном RAG-пути — с подмешанным контекстом.
         full_answer_parts: list[str] = []
-        for piece in _generator.generate_stream(effective_query, chunks_for_prompt):
-            full_answer_parts.append(piece)
-            yield _sse_event("token", {"text": piece})
-
-        # 3. Сохраняем сообщения в историю (если работаем в чате) с полным
-        #    pipeline-снимком. После refresh UI восстановит шаги.
-        full_answer = "".join(full_answer_parts)
-        _save_chat_messages(
-            chat_id, query, full_answer,
-            chunks=chunks_serializable,
-            explain=explain_dict,
-            prompt=prompt_text,
-        )
+        if should_fallback:
+            history = (
+                _history_store.get_recent(chat_id, limit=8)
+                if chat_id and _history_store else []
+            )
+            token_iter = _generate_direct_answer(
+                effective_query, history, intent="general", stream=True,
+            )
+        else:
+            token_iter = _generator.generate_stream(
+                effective_query, chunks_for_prompt,
+            )
+        try:
+            for piece in token_iter:
+                full_answer_parts.append(piece)
+                yield _sse_event("token", {"text": piece})
+        finally:
+            # 3. Сохраняем сообщения в историю даже если клиент отвалился
+            #    (GeneratorExit на yield во время стрима). Иначе ответ
+            #    «уехал» в UI, но в БД его нет — после reload бабл пропадает.
+            if full_answer_parts:
+                full_answer = "".join(full_answer_parts)
+                _save_chat_messages(
+                    chat_id, query, full_answer,
+                    chunks=chunks_serializable,
+                    explain=explain_dict,
+                    prompt=prompt_text if prompt_text else None,
+                )
 
         # 4. Сигнал конца.
         yield _sse_event("done", {})
@@ -1739,4 +1945,139 @@ def index() -> FileResponse:
     return FileResponse(
         _STATIC_DIR / "index.html",
         headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
+
+
+# ============================================================================
+# Agent (Spec 1: LangGraph-based skkrondo concierge)
+# ============================================================================
+
+class AgentAskRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=2000)
+
+
+class TraceEvent(BaseModel):
+    type: str
+    timestamp: str
+    data: dict
+
+
+class AgentAskResponse(BaseModel):
+    answer: str
+    trace: list[TraceEvent]
+    iterations: int
+
+
+class AgentMessageOut(BaseModel):
+    id: int
+    role: str
+    content: str
+    trace: list[TraceEvent] | None = None
+    created_at: str
+
+
+def _save_agent_message(role: str, content: str, trace: list | None) -> int:
+    """Сохраняет один agent_message в БД. Возвращает id вставленной строки."""
+    assert _store is not None
+    with _store._conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO agent_messages (role, content, trace)
+            VALUES (%s, %s, %s::jsonb)
+            RETURNING id
+            """,
+            (role, content, json.dumps(trace) if trace is not None else None),
+        )
+        row = cur.fetchone()
+    return row[0]
+
+
+def _list_agent_messages(limit: int = 200) -> list[AgentMessageOut]:
+    assert _store is not None
+    with _store._conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, role, content, trace, created_at
+            FROM agent_messages
+            ORDER BY id ASC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        rows = cur.fetchall()
+    return [
+        AgentMessageOut(
+            id=r[0],
+            role=r[1],
+            content=r[2],
+            trace=r[3] if r[3] is not None else None,
+            created_at=r[4].isoformat(),
+        )
+        for r in rows
+    ]
+
+
+async def _save_agent_message_async(role: str, content: str, trace: list | None) -> int:
+    """Async-обёртка над sync psycopg-вызовом. psycopg-коннект — синхронный
+    (autocommit=True от VectorStore), а вызывается из async-эндпоинта —
+    без to_thread INSERT блокирует event loop на время round-trip'а к Postgres."""
+    return await asyncio.to_thread(_save_agent_message, role, content, trace)
+
+
+@app.post("/api/agent/ask", response_model=AgentAskResponse)
+async def agent_ask(req: AgentAskRequest) -> AgentAskResponse:
+    """Non-streaming прогон агента. Сохраняет user+assistant пару в БД."""
+    await _save_agent_message_async("user", req.query, None)
+    try:
+        result = await run_collect(req.query)
+    except Exception as exc:
+        # Защита от orphan'а: user-сообщение уже в БД, нужно записать
+        # и assistant-плейсхолдер чтобы история не висела «полузаписанной».
+        await _save_agent_message_async("assistant", f"Внутренняя ошибка: {exc}", [])
+        raise
+    await _save_agent_message_async("assistant", result.answer, result.trace)
+    return AgentAskResponse(
+        answer=result.answer,
+        trace=[TraceEvent(**e) for e in result.trace],
+        iterations=result.iterations,
+    )
+
+
+@app.get("/api/agent/messages", response_model=list[AgentMessageOut])
+def agent_messages(limit: int = 200) -> list[AgentMessageOut]:
+    return _list_agent_messages(limit=limit)
+
+
+@app.get("/api/agent/ask/stream")
+async def agent_ask_stream(query: str) -> StreamingResponse:
+    """SSE-стрим events во время прогона графа. По завершении сохраняет
+    user+assistant пару в БД (даже если клиент успел отсоединиться —
+    через try/finally в event_source, по тому же паттерну что в RAG-стриме).
+    """
+    if not query.strip():
+        raise HTTPException(status_code=400, detail="query пуст")
+
+    await _save_agent_message_async("user", query, None)
+
+    async def event_source():
+        full_trace: list[dict] = []
+        final_answer = ""
+        try:
+            async for event in run_stream(query):
+                full_trace.append(event)
+                if event["type"] == "final_answer":
+                    final_answer = event["data"]["text"]
+                yield _sse_event(event["type"], event["data"])
+        finally:
+            # Сохраняем даже при дисконнекте клиента — иначе ответ
+            # «уехал» в UI, но в БД его нет.
+            if full_trace:
+                await _save_agent_message_async(
+                    "assistant", final_answer, full_trace,
+                )
+
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

@@ -22,9 +22,15 @@ interface Props {
 /**
  * Парсит "...текст [1] ещё [2]..." и заменяет [N] на кликабельные чипы,
  * которые скроллят к соответствующему чанку (id="chunk-N") и подсвечивают его.
+ *
+ * Понимает варианты:
+ *   [1], [2]               — каноничный формат
+ *   [Фрагмент 1]           — то что иногда выдаёт Gemma вопреки промпту
+ *   [фрагмент 1], [Frag 1] — нечувствительно к регистру
  */
 function renderWithCitations(text: string, chunksCount: number) {
-  const parts = text.split(/\[(\d+)\]/g);
+  // Группа захвата (\d+) на месте N — split вернёт цифру в нечётных позициях.
+  const parts = text.split(/\[(?:фрагмент|frag(?:ment)?)?\s*(\d+)\]/gi);
   return parts.map((piece, i) => {
     if (i % 2 === 0) return piece;
     const n = parseInt(piece, 10);
@@ -103,10 +109,26 @@ export function MessageBubble({
   streaming,
 }: Props) {
   const [detailsOpen, setDetailsOpen] = React.useState(false);
+  // Auto-fallback: Auto-режим попробовал RAG, но top similarity оказалась
+  // ниже порога — ответ пришёл из общей LLM-эрудиции, retrieve-данные есть
+  // в drawer'е для прозрачности.
+  const isAutoFallback =
+    role === "assistant" && explain?.auto_fallback === true;
+  // Условие «ручной bypass»: RAG был пропущен, но не из-за router'а
+  // (router заполнил бы routed=true и route_intent). Если routed=false и
+  // rag_skipped=true — значит пользователь явно выбрал режим Off.
+  const isManualBypass =
+    role === "assistant" &&
+    explain != null &&
+    explain.rag_skipped === true &&
+    !explain.routed;
+  // Кнопку «детали ответа» оставляем доступной и в bypass-режиме: пользователь
+  // всё равно хочет глянуть как ассистент думал (а с приходом LangGraph там
+  // будет видна траектория графа узлов).
   const hasDetails = role === "assistant" && explain != null;
 
   return (
-    <div className={cn("flex gap-3 group", role === "user" ? "flex-row-reverse" : "flex-row")}>
+    <div className={cn("flex gap-3 group", role === "user" ? "flex-row-reverse" : "flex-row", (isManualBypass || isAutoFallback) && "mb-5")}>
       <div
         className={cn(
           "h-7 w-7 shrink-0 rounded-full flex items-center justify-center border",
@@ -189,6 +211,22 @@ export function MessageBubble({
             >
               <Sparkles className="h-3.5 w-3.5" />
             </button>
+          )}
+          {isManualBypass && (
+            <div className="absolute -bottom-5 left-0 text-[10px] text-muted-foreground">
+              <span className="inline-flex items-center gap-1 rounded-full border border-border bg-card px-2 py-0.5">
+                <span aria-hidden>○</span>
+                RAG не использовался — режим обычного чата
+              </span>
+            </div>
+          )}
+          {isAutoFallback && (
+            <div className="absolute -bottom-5 left-0 text-[10px] text-amber-500/90">
+              <span className="inline-flex items-center gap-1 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5">
+                <span aria-hidden>◐</span>
+                Ответ не из базы — RAG не нашёл достаточно релевантного контекста
+              </span>
+            </div>
           )}
         </div>
       </div>

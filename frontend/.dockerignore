@@ -1,0 +1,11 @@
+# Контекст для docker/Dockerfile.frontend (директория frontend/).
+node_modules
+.next
+.git
+.gitignore
+.DS_Store
+*.tsbuildinfo
+
+# .env.local подмешивается на хосте — внутри контейнера используем
+# build-arg NEXT_PUBLIC_API_BASE_URL.
+.env*

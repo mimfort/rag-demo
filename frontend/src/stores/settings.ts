@@ -75,7 +75,28 @@ export const useSettings = create<SettingsState>()(
         });
       },
     }),
-    { name: "rag-frontend-settings-v1" },
+    {
+      name: "rag-frontend-settings-v1",
+      version: 2,
+      migrate: (persistedState: any, version: number) => {
+        if (!persistedState) return persistedState;
+        if (version < 2) {
+          // Старые записи не знают про rag_mode — дефолт "auto".
+          const fixDef = (s: any) =>
+            s && s.rag_mode === undefined ? { ...s, rag_mode: "auto" } : s;
+          return {
+            ...persistedState,
+            default: fixDef(persistedState.default) ?? DEFAULT_SETTINGS,
+            perChat: Object.fromEntries(
+              Object.entries(persistedState.perChat ?? {}).map(
+                ([k, v]) => [k, fixDef(v)],
+              ),
+            ),
+          };
+        }
+        return persistedState;
+      },
+    },
   ),
 );
 
@@ -94,6 +115,7 @@ export const PRESETS: Record<string, Partial<RetrievalSettings>> = {
     min_rerank_score: 0,
     auto_route: true,
     streaming: true,
+    rag_mode: "auto",
   },
   /** Сбалансированный — то что обычно стоит по умолчанию. */
   balanced: {
@@ -108,6 +130,7 @@ export const PRESETS: Record<string, Partial<RetrievalSettings>> = {
     min_rerank_score: 0.05,
     auto_route: true,
     streaming: true,
+    rag_mode: "auto",
   },
   /** Максимум качества — все слои на. Медленно. */
   thorough: {
@@ -123,5 +146,6 @@ export const PRESETS: Record<string, Partial<RetrievalSettings>> = {
     min_rerank_score: 0.05,
     auto_route: true,
     streaming: true,
+    rag_mode: "auto",
   },
 };

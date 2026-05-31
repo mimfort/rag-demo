@@ -34,6 +34,11 @@ export function ChatView({ chatId }: Props) {
   const queryClient = useQueryClient();
   const router = useRouter();
   const settings = useSettings((s) => s.getFor(chatId));
+  const setSettings = useSettings((s) => s.setFor);
+  const handleRagModeChange = React.useCallback(
+    (v: typeof settings.rag_mode) => setSettings(chatId, { rag_mode: v }),
+    [chatId, setSettings],
+  );
   const draft = useChatUi((s) => s.draft);
   const setDraft = useChatUi((s) => s.setDraft);
   const updateDraft = useChatUi((s) => s.updateDraft);
@@ -71,22 +76,6 @@ export function ChatView({ chatId }: Props) {
       router.push(`/chat/${chat.id}`);
     },
   });
-
-  /** Отправить вопрос: streaming или non-streaming в зависимости от настроек. */
-  const handleSend = React.useCallback(
-    async (text: string) => {
-      // Если работаем «без чата» — создаём чат и переходим в него,
-      // первое сообщение отправит уже там (см. эффект ниже через query).
-      if (chatId === null) {
-        const chat = await createChat.mutateAsync(text);
-        // Стартуем стрим сразу — но через новый chatId.
-        startStream(text, chat.id);
-        return;
-      }
-      startStream(text, chatId);
-    },
-    [chatId, createChat],
-  );
 
   /** Подготовка и запуск SSE / REST. */
   const startStream = React.useCallback(
@@ -208,6 +197,25 @@ export function ChatView({ chatId }: Props) {
     [draft, settings, queryClient, setDraft, updateDraft, setLastAnswer],
   );
 
+  /** Отправить вопрос: streaming или non-streaming в зависимости от настроек. */
+  const handleSend = React.useCallback(
+    async (text: string) => {
+      // Если работаем «без чата» — создаём чат и переходим в него,
+      // первое сообщение отправит уже там (см. эффект ниже через query).
+      if (chatId === null) {
+        const chat = await createChat.mutateAsync(text);
+        // Стартуем стрим сразу — но через новый chatId.
+        startStream(text, chat.id);
+        return;
+      }
+      startStream(text, chatId);
+    },
+    // startStream закрывается над settings, поэтому обязан быть в deps —
+    // иначе после смены chip'а handleSend будет использовать stale-функцию
+    // с устаревшим rag_mode и слать неправильные флаги на бэк.
+    [chatId, createChat, startStream],
+  );
+
   const handleStop = React.useCallback(() => {
     draft?.abort?.();
     setDraft(null);
@@ -275,6 +283,8 @@ export function ChatView({ chatId }: Props) {
         onStop={handleStop}
         onOpenSettings={() => setSettingsOpen(true)}
         busy={isStreaming}
+        ragMode={settings.rag_mode}
+        onRagModeChange={handleRagModeChange}
       />
 
       <SettingsDrawer
@@ -294,8 +304,9 @@ function EmptyState() {
       </div>
       <h2 className="text-xl font-semibold">Чат с базой знаний</h2>
       <p className="text-sm text-muted-foreground max-w-md">
-        Задай вопрос — система найдёт ответ в загруженных документах. Включи
-        auto-route в настройках чтобы LLM сам решал когда нужен RAG.
+        Задай вопрос — система найдёт ответ в загруженных документах.
+        Переключателем RAG в строке ввода можно выбрать Auto (LLM сам решает),
+        On (всегда искать) или Off (обычный чат без базы).
       </p>
       <div className="flex items-center gap-2 mt-2 text-xs text-muted-foreground">
         <MessageSquare className="h-3.5 w-3.5" />
