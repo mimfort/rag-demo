@@ -1,0 +1,42 @@
+# Бэкенд: FastAPI + LangGraph-агент + RAG-pipeline.
+#
+# Слои отделены: requirements.txt копируется и устанавливается ДО основного
+# кода — пока зависимости не меняются, pip-слой кэшируется и пересборка
+# на правке web/server.py идёт за секунды.
+#
+# Heavy-зависимости (torch, transformers через sentence-transformers) тянут
+# ~2 ГБ. Это нормально для slim-образа python:3.12 — сборка ~5-10 минут
+# первый раз, потом из кэша.
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+# Системные библиотеки, которые могут понадобиться pdf-парсеру/torch.
+# build-essential убираем после pip install — wheels уже готовы.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt ./
+RUN pip install -r requirements.txt
+
+# Копируем только то, что нужно бэку. Frontend/.venv/node_modules
+# отсекаются через .dockerignore.
+COPY rag ./rag
+COPY web ./web
+COPY agent ./agent
+COPY evals ./evals
+COPY db ./db
+COPY docs ./docs
+COPY ingest.py ask.py ./
+
+EXPOSE 8000
+
+# --host 0.0.0.0 чтобы порт пробрасывался наружу контейнера.
+# Без --reload: production-режим, изменения в коде требуют пересборки/рестарта.
+CMD ["uvicorn", "web.server:app", "--host", "0.0.0.0", "--port", "8000"]

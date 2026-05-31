@@ -22,9 +22,15 @@ interface Props {
 /**
  * Парсит "...текст [1] ещё [2]..." и заменяет [N] на кликабельные чипы,
  * которые скроллят к соответствующему чанку (id="chunk-N") и подсвечивают его.
+ *
+ * Понимает варианты:
+ *   [1], [2]               — каноничный формат
+ *   [Фрагмент 1]           — то что иногда выдаёт Gemma вопреки промпту
+ *   [фрагмент 1], [Frag 1] — нечувствительно к регистру
  */
 function renderWithCitations(text: string, chunksCount: number) {
-  const parts = text.split(/\[(\d+)\]/g);
+  // Группа захвата (\d+) на месте N — split вернёт цифру в нечётных позициях.
+  const parts = text.split(/\[(?:фрагмент|frag(?:ment)?)?\s*(\d+)\]/gi);
   return parts.map((piece, i) => {
     if (i % 2 === 0) return piece;
     const n = parseInt(piece, 10);

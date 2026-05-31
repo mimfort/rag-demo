@@ -58,15 +58,43 @@ rag-demo/
 
 ## Как запустить
 
+### TL;DR — всё одной командой
+
+```bash
+docker compose up -d --build
+```
+
+Поднимет три контейнера:
+- `rag_postgres` (pgvector) на :5433
+- `rag_backend` (FastAPI + LangGraph-агент) на :8000
+- `rag_frontend` (Next.js) на :3000 → http://localhost:3000
+
+Требования:
+- `.env` рядом (скопируй `.env.example`).
+- LM Studio запущена **на хосте** на :1234 — контейнер ходит туда через
+  `host.docker.internal` (на Linux это разрешено через `extra_hosts:
+  host-gateway` в compose). Внутрикомпозный `DB_HOST` уже переопределён
+  на `postgres` — менять `.env` не нужно.
+- Reranker-модель (~570 МБ) скачается при первом обращении в volume
+  `hf_cache` — дальше старт мгновенный.
+
+Проиндексировать корпус **внутри** контейнера:
+```bash
+docker compose exec backend python ingest.py
+```
+
+Дальше всё ниже — про **локальный запуск без Docker** (если правишь код
+и нужен hot-reload).
+
 ### 1. Поднять Postgres
 
 ```bash
-docker compose up -d
+docker compose up -d postgres
 ```
 
-Это запустит контейнер `rag_postgres` на порту 5432 и при первом запуске
-выполнит `db/init.sql`: создаст расширение `vector`, таблицу `chunks` и
-HNSW-индекс.
+Это запустит контейнер `rag_postgres` на порту 5433 и при первом запуске
+выполнит `db/init.sql` + `db/init_agent.sql`: создаст расширение `vector`,
+таблицы `chunks`/`chats`/`messages`/`agent_messages` и индексы.
 
 Проверить что всё ок:
 

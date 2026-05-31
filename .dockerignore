@@ -1,0 +1,33 @@
+# Применяется к контексту сборки docker/Dockerfile.backend (корень репо).
+# Чем меньше попадёт в контекст — тем быстрее `docker build` и тем меньше
+# случайных «cache busters».
+.venv
+.git
+.gitignore
+.idea
+.vscode
+.DS_Store
+
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# .env с секретами — НЕ в образ. Передаём через env_file в compose.
+.env
+.env.local
+
+# Фронту нечего делать в backend-образе.
+frontend
+
+# Документация/тесты/прочее не нужны в рантайме.
+README.md
+docs/_build
+test-upload.md
+
+# Docker-файлы (не нужны внутри образа).
+docker
+docker-compose.yml

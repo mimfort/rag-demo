@@ -1,0 +1,42 @@
+# Фронтенд: Next.js 15 (App Router) → production build.
+#
+# Multi-stage: builder ставит зависимости и собирает .next/, runner забирает
+# только нужное для выполнения. NEXT_PUBLIC_* переменные «вшиваются» в JS
+# на стадии build — поэтому NEXT_PUBLIC_API_BASE_URL передаётся как ARG.
+
+# ── builder ────────────────────────────────────────────────────────────
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Сначала только манифесты — npm ci кэшируется пока package*.json не меняется.
+COPY package.json package-lock.json ./
+RUN npm ci
+
+# Теперь весь исходник. .dockerignore отсекает node_modules/.next/*.tsbuildinfo.
+COPY . .
+
+# URL бэка для браузерных запросов из собранного бандла. По умолчанию
+# браузер ходит напрямую на хост:8000 (мимо Next.js dev-proxy — иначе
+# SSE-стрим буферизуется и токены приходят пачкой).
+ARG NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
+ENV NEXT_PUBLIC_API_BASE_URL=$NEXT_PUBLIC_API_BASE_URL
+
+RUN npm run build
+
+# ── runner ─────────────────────────────────────────────────────────────
+FROM node:20-alpine AS runner
+
+WORKDIR /app
+
+ENV NODE_ENV=production \
+    PORT=3000
+
+# next start читает .next + использует node_modules. Тянем оба + package.json.
+COPY --from=builder /app/.next ./.next
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/package.json ./package.json
+COPY --from=builder /app/next.config.mjs ./next.config.mjs
+
+EXPOSE 3000
+CMD ["npm", "start"]
