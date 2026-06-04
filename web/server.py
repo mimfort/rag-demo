@@ -28,6 +28,7 @@ import asyncio
 import json
 import math
 import time
+import uuid
 from pathlib import Path
 from typing import Iterator
 
@@ -2024,15 +2025,36 @@ async def _save_agent_message_async(role: str, content: str, trace: list | None)
     return await asyncio.to_thread(_save_agent_message, role, content, trace)
 
 
+# In-memory накопление trace по thread_id: clarify-круги и финальный ответ
+# размазаны по нескольким HTTP-запросам одного turn'а. Парно с MemorySaver
+# (тоже in-memory). На `done` сохраняем полный trace и чистим запись.
+_agent_trace_buffers: dict[str, list[dict]] = {}
+
+# Кап на число «живых» turn'ов (буферов trace), которые ждут подтверждения.
+# Если пользователь бросает clarify не ответив, запись висит вечно — здесь
+# вытесняем самые старые (dict хранит порядок вставки), чтобы не течь.
+_MAX_LIVE_TURNS = 100
+
+# Лимит длины уточнения пользователя на «нет» (как query в AgentAskRequest).
+_MAX_CORRECTION_LEN = 2000
+
+
+def _register_turn_buffer(thread_id: str) -> None:
+    """Заводит буфер для нового turn'а, вытесняя самый старый при переполнении."""
+    while len(_agent_trace_buffers) >= _MAX_LIVE_TURNS:
+        oldest = next(iter(_agent_trace_buffers))
+        _agent_trace_buffers.pop(oldest, None)
+    _agent_trace_buffers[thread_id] = []
+
+
 @app.post("/api/agent/ask", response_model=AgentAskResponse)
 async def agent_ask(req: AgentAskRequest) -> AgentAskResponse:
-    """Non-streaming прогон агента. Сохраняет user+assistant пару в БД."""
+    """Non-streaming прогон агента (авто-подтверждение). Сохраняет user+assistant."""
+    thread_id = uuid.uuid4().hex
     await _save_agent_message_async("user", req.query, None)
     try:
-        result = await run_collect(req.query)
+        result = await run_collect(req.query, thread_id=thread_id)
     except Exception as exc:
-        # Защита от orphan'а: user-сообщение уже в БД, нужно записать
-        # и assistant-плейсхолдер чтобы история не висела «полузаписанной».
         await _save_agent_message_async("assistant", f"Внутренняя ошибка: {exc}", [])
         raise
     await _save_agent_message_async("assistant", result.answer, result.trace)
@@ -2050,31 +2072,68 @@ def agent_messages(limit: int = 200) -> list[AgentMessageOut]:
 
 @app.get("/api/agent/ask/stream")
 async def agent_ask_stream(query: str) -> StreamingResponse:
-    """SSE-стрим events во время прогона графа. По завершении сохраняет
-    user+assistant пару в БД (даже если клиент успел отсоединиться —
-    через try/finally в event_source, по тому же паттерну что в RAG-стриме).
-    """
+    """SSE-стрим старта turn'а. Генерит thread_id, стримит до первого clarify.
+    user-сообщение сохраняется здесь; assistant — на событии done (в resume)."""
     if not query.strip():
         raise HTTPException(status_code=400, detail="query пуст")
 
+    thread_id = uuid.uuid4().hex
     await _save_agent_message_async("user", query, None)
+    _register_turn_buffer(thread_id)
 
     async def event_source():
-        full_trace: list[dict] = []
-        final_answer = ""
-        try:
-            async for event in run_stream(query):
-                full_trace.append(event)
-                if event["type"] == "final_answer":
-                    final_answer = event["data"]["text"]
-                yield _sse_event(event["type"], event["data"])
-        finally:
-            # Сохраняем даже при дисконнекте клиента — иначе ответ
-            # «уехал» в UI, но в БД его нет.
-            if full_trace:
-                await _save_agent_message_async(
-                    "assistant", final_answer, full_trace,
-                )
+        async for event in _agent_turn_events(
+            thread_id, query=query, resume=None,
+        ):
+            yield _sse_event(event["type"], event["data"])
+
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+async def _agent_turn_events(thread_id: str, *, query, resume):
+    """Прогон одного шага turn'а (старт или resume) с накоплением trace.
+    На done сохраняет assistant-сообщение с полным trace и чистит буфер."""
+    buf = _agent_trace_buffers.setdefault(thread_id, [])
+    final_answer = ""
+    async for event in run_stream(thread_id, query=query, resume=resume):
+        buf.append(event)
+        if event["type"] == "final_answer":
+            final_answer = event["data"]["text"]
+        if event["type"] in ("done", "error"):
+            await _save_agent_message_async("assistant", final_answer, list(buf))
+            _agent_trace_buffers.pop(thread_id, None)
+        yield event
+
+
+@app.get("/api/agent/resume/stream")
+async def agent_resume_stream(
+    thread_id: str,
+    confirmed: bool,
+    correction: str = "",
+) -> StreamingResponse:
+    """Возобновление после подтверждения. confirmed=true → агент работает;
+    confirmed=false + correction → новый круг clarify."""
+    if not thread_id.strip():
+        raise HTTPException(status_code=400, detail="thread_id пуст")
+    # Пауза clarify держит буфер живым (он чистится только на done/error).
+    # Если буфера нет — turn неизвестен, уже завершён или брошен: резюмить
+    # нечего, а Command(resume=...) на «пустом» графе повёл бы себя странно.
+    if thread_id not in _agent_trace_buffers:
+        raise HTTPException(status_code=409, detail="нет активного turn'а для этого thread_id")
+    if len(correction) > _MAX_CORRECTION_LEN:
+        raise HTTPException(status_code=400, detail="correction слишком длинный")
+
+    resume = {"confirmed": confirmed, "correction": correction or None}
+
+    async def event_source():
+        async for event in _agent_turn_events(
+            thread_id, query=None, resume=resume,
+        ):
+            yield _sse_event(event["type"], event["data"])
 
     return StreamingResponse(
         event_source(),

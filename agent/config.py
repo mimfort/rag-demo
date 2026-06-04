@@ -16,6 +16,11 @@ load_dotenv()
 # При превышении runner emit'нёт error и завершит граф.
 MAX_ITER: int = 10
 
+# Гард против бесконечного цикла подтверждения (interpret ⇄ confirm).
+# После стольких кругов «нет» агент принудительно принимает последнюю
+# интерпретацию и идёт работать.
+MAX_CLARIFY_ROUNDS: int = 5
+
 # Таймаут httpx-вызовов к skkrondo API (одного запроса).
 HTTP_TIMEOUT_SEC: float = 10.0
 

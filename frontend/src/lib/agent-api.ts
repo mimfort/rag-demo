@@ -46,4 +46,14 @@ export const agentApi = {
     const params = new URLSearchParams({ query });
     return apiUrl(`/api/agent/ask/stream?${params.toString()}`);
   },
+
+  /** Возобновление turn'а: подтверждение (да/нет + уточнение). GET для EventSource. */
+  buildResumeUrl: (opts: { threadId: string; confirmed: boolean; correction?: string }) => {
+    const params = new URLSearchParams({
+      thread_id: opts.threadId,
+      confirmed: String(opts.confirmed),
+    });
+    if (opts.correction) params.set("correction", opts.correction);
+    return apiUrl(`/api/agent/resume/stream?${params.toString()}`);
+  },
 };

@@ -10,9 +10,10 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { agentApi } from "@/lib/agent-api";
-import type { AgentMessage, TraceEvent } from "@/lib/agent-types";
+import type { AgentMessage, TraceEvent, ClarifyData } from "@/lib/agent-types";
 import { useAgentUi } from "@/stores/agent-ui";
 import { TraceTimeline } from "./trace-timeline";
+import { ClarifyPrompt } from "./clarify-prompt";
 
 export function AgentChat() {
   const queryClient = useQueryClient();
@@ -21,6 +22,7 @@ export function AgentChat() {
   const appendTrace = useAgentUi((s) => s.appendTrace);
   const setAnswer = useAgentUi((s) => s.setAnswer);
   const setFinished = useAgentUi((s) => s.setFinished);
+  const setPendingClarify = useAgentUi((s) => s.setPendingClarify);
 
   const [text, setText] = React.useState("");
   const bottomRef = React.useRef<HTMLDivElement>(null);
@@ -34,56 +36,101 @@ export function AgentChat() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messagesQuery.data?.length, draft?.trace.length]);
 
+  const openStream = React.useCallback(
+    (url: string) => {
+      const es = new EventSource(url);
+      // Флаг штатного закрытия: clarify-пауза и done/error закрывают сокет
+      // намеренно, и браузер всё равно выстрелит native error-событием (без
+      // .data). Без этого флага на каждую паузу показывался бы ложный тост.
+      let closedClean = false;
+      const closeClean = () => {
+        closedClean = true;
+        es.close();
+      };
+      const abort = () => closeClean();
+      // Обновляем только abort, остальной draft не трогаем.
+      useAgentUi.setState((s) => (s.draft ? { draft: { ...s.draft, abort } } : {}));
+
+      const onEvent = (type: TraceEvent["type"]) => (e: MessageEvent) => {
+        try {
+          const data = JSON.parse(e.data);
+          const ev: TraceEvent = { type, timestamp: new Date().toISOString(), data };
+          appendTrace(ev);
+
+          if (type === "clarify") {
+            setPendingClarify(data as ClarifyData);
+            closeClean(); // граф на паузе; продолжим через resume
+            return;
+          }
+          if (type === "final_answer" && typeof data.text === "string") {
+            setAnswer(data.text);
+          }
+          if (type === "done" || type === "error") {
+            setFinished(true);
+            closeClean();
+            queryClient.invalidateQueries({ queryKey: ["agent", "messages"] });
+            setTimeout(() => setDraft(null), 800);
+          }
+        } catch (err) {
+          console.error("SSE parse failed", err);
+        }
+      };
+
+      es.addEventListener("clarify", onEvent("clarify"));
+      es.addEventListener("node_start", onEvent("node_start"));
+      es.addEventListener("tool_call", onEvent("tool_call"));
+      es.addEventListener("tool_result", onEvent("tool_result"));
+      es.addEventListener("final_answer", onEvent("final_answer"));
+      es.addEventListener("done", onEvent("done"));
+      es.addEventListener("error", (e) => {
+        const msgEv = e as MessageEvent;
+        if (msgEv.data) {
+          onEvent("error")(msgEv);
+        } else if (!closedClean) {
+          // native error без .data на НЕштатном разрыве — настоящий обрыв связи.
+          toast.error("SSE-соединение прервано");
+          setFinished(true);
+          es.close();
+          setDraft(null);
+        }
+      });
+    },
+    [appendTrace, setAnswer, setFinished, setDraft, setPendingClarify, queryClient],
+  );
+
   const send = React.useCallback(() => {
     const q = text.trim();
     if (!q || draft) return;
     setText("");
-    setDraft({ userQuery: q, trace: [], answer: "", finished: false, abort: null });
-
-    const url = agentApi.buildStreamUrl(q);
-    const es = new EventSource(url);
-    const abort = () => es.close();
-    setDraft({ userQuery: q, trace: [], answer: "", finished: false, abort });
-
-    const onEvent = (type: TraceEvent["type"]) => (e: MessageEvent) => {
-      try {
-        const data = JSON.parse(e.data);
-        const ev: TraceEvent = { type, timestamp: new Date().toISOString(), data };
-        appendTrace(ev);
-        if (type === "final_answer" && typeof data.text === "string") {
-          setAnswer(data.text);
-        }
-        if (type === "done" || type === "error") {
-          setFinished(true);
-          es.close();
-          queryClient.invalidateQueries({ queryKey: ["agent", "messages"] });
-          // Через 800ms убираем draft — к этому моменту /messages уже отдаст
-          // assistant-сообщение, отсорсенное из БД.
-          setTimeout(() => setDraft(null), 800);
-        }
-      } catch (err) {
-        console.error("SSE parse failed", err);
-      }
-    };
-
-    es.addEventListener("node_start", onEvent("node_start"));
-    es.addEventListener("tool_call", onEvent("tool_call"));
-    es.addEventListener("tool_result", onEvent("tool_result"));
-    es.addEventListener("final_answer", onEvent("final_answer"));
-    es.addEventListener("done", onEvent("done"));
-    es.addEventListener("error", (e) => {
-      // Стандартный EventSource error event (без data) — это разрыв связи.
-      const msgEv = e as MessageEvent;
-      if (msgEv.data) {
-        onEvent("error")(msgEv);
-      } else {
-        toast.error("SSE-соединение прервано");
-        setFinished(true);
-        es.close();
-        setDraft(null);
-      }
+    setDraft({
+      userQuery: q,
+      trace: [],
+      answer: "",
+      finished: false,
+      abort: null,
+      pendingClarify: null,
     });
-  }, [text, draft, setDraft, appendTrace, setAnswer, setFinished, queryClient]);
+    openStream(agentApi.buildStreamUrl(q));
+  }, [text, draft, setDraft, openStream]);
+
+  const onConfirm = React.useCallback(() => {
+    const pc = draft?.pendingClarify;
+    if (!pc) return;
+    setPendingClarify(null);
+    openStream(agentApi.buildResumeUrl({ threadId: pc.thread_id, confirmed: true }));
+  }, [draft, setPendingClarify, openStream]);
+
+  const onReject = React.useCallback(
+    (correction: string) => {
+      const pc = draft?.pendingClarify;
+      if (!pc) return;
+      setPendingClarify(null);
+      openStream(
+        agentApi.buildResumeUrl({ threadId: pc.thread_id, confirmed: false, correction }),
+      );
+    },
+    [draft, setPendingClarify, openStream],
+  );
 
   const stop = React.useCallback(() => {
     draft?.abort?.();
@@ -91,7 +138,8 @@ export function AgentChat() {
   }, [draft, setDraft]);
 
   const messages: AgentMessage[] = messagesQuery.data ?? [];
-  const isStreaming = draft !== null && !draft.finished;
+  // Во время ожидания подтверждения не показываем «стоп»/курсор стрима.
+  const isStreaming = draft !== null && !draft.finished && !draft.pendingClarify;
 
   return (
     <div className="flex h-full flex-col">
@@ -135,6 +183,15 @@ export function AgentChat() {
                 trace={draft.trace}
                 streaming={isStreaming}
               />
+              {draft.pendingClarify && (
+                <div className="ml-10">
+                  <ClarifyPrompt
+                    data={draft.pendingClarify}
+                    onConfirm={onConfirm}
+                    onReject={onReject}
+                  />
+                </div>
+              )}
             </>
           )}
 

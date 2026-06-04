@@ -1,15 +1,23 @@
 /**
  * Типы LangGraph-агента — зеркало Pydantic-моделей бэка
- * (см. rag/api/agent_routes.py и rag/agent/*).
+ * (см. web/server.py и agent/*).
  */
 
 export type AgentEventType =
+  | "clarify"
   | "node_start"
   | "tool_call"
   | "tool_result"
   | "final_answer"
   | "done"
   | "error";
+
+export interface ClarifyData {
+  thread_id: string;
+  interpretation: string;
+  original: string;
+  round: number;
+}
 
 export interface TraceEvent {
   type: AgentEventType;

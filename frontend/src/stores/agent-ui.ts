@@ -7,7 +7,7 @@
  */
 
 import { create } from "zustand";
-import type { TraceEvent } from "@/lib/agent-types";
+import type { TraceEvent, ClarifyData } from "@/lib/agent-types";
 
 /** Draft assistant-сообщения во время стрима (накапливающийся trace). */
 export interface AgentDraft {
@@ -16,6 +16,7 @@ export interface AgentDraft {
   answer: string;       // обновляется на final_answer event
   finished: boolean;
   abort: (() => void) | null;
+  pendingClarify: ClarifyData | null;  // карточка подтверждения (null — нет паузы)
 }
 
 interface AgentUIState {
@@ -24,6 +25,7 @@ interface AgentUIState {
   appendTrace: (ev: TraceEvent) => void;
   setAnswer: (text: string) => void;
   setFinished: (v: boolean) => void;
+  setPendingClarify: (c: ClarifyData | null) => void;
 }
 
 export const useAgentUi = create<AgentUIState>((set) => ({
@@ -38,4 +40,6 @@ export const useAgentUi = create<AgentUIState>((set) => ({
     set((s) => (s.draft ? { draft: { ...s.draft, answer: text } } : s)),
   setFinished: (v) =>
     set((s) => (s.draft ? { draft: { ...s.draft, finished: v } } : s)),
+  setPendingClarify: (c) =>
+    set((s) => (s.draft ? { draft: { ...s.draft, pendingClarify: c } } : s)),
 }));
