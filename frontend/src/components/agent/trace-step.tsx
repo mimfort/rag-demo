@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { ChevronRight, Wrench, MessageSquare, Brain, CheckCircle2, AlertCircle } from "lucide-react";
+import { ChevronRight, Wrench, MessageSquare, Brain, CheckCircle2, AlertCircle, HelpCircle } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { TraceEvent } from "@/lib/agent-types";
 
@@ -11,6 +11,7 @@ interface Props {
 
 function eventIcon(type: TraceEvent["type"]) {
   switch (type) {
+    case "clarify":      return HelpCircle;
     case "node_start":   return Brain;
     case "tool_call":    return Wrench;
     case "tool_result":  return CheckCircle2;
@@ -22,9 +23,17 @@ function eventIcon(type: TraceEvent["type"]) {
 
 function eventTitle(ev: TraceEvent): string {
   switch (ev.type) {
+    case "clarify": {
+      const interp = ev.data.interpretation as string;
+      const round = (ev.data.round as number) ?? 0;
+      return `🤔 Уточнение${round > 1 ? ` (круг ${round})` : ""}: «${interp}»`;
+    }
     case "node_start": {
       const node = ev.data.node as string;
-      return node === "agent" ? "Думаю..." : `Узел: ${node}`;
+      if (node === "agent") return "Думаю...";
+      if (node === "interpret") return "Интерпретирую запрос…";
+      if (node === "confirm") return "Уточнение";
+      return `Узел: ${node}`;
     }
     case "tool_call": {
       const name = ev.data.name as string;
@@ -53,6 +62,7 @@ function eventColor(type: TraceEvent["type"]): string {
     case "final_answer":  return "text-primary";
     case "tool_call":     return "text-amber-400";
     case "tool_result":   return "text-emerald-400";
+    case "clarify":       return "text-amber-400";
     default:              return "text-muted-foreground";
   }
 }

@@ -2,13 +2,14 @@
 Runner — обёртка над graph.astream(stream_mode="updates"), которая
 конвертирует LangGraph-обновления в наши SSE-events.
 
-Event types (см. spec):
-  - node_start  {node}             — вошли в узел
-  - tool_call   {name, args, id}   — agent сгенерировал tool_call
-  - tool_result {name, args, id, result} — tools-узел вернул результат
-  - final_answer {text}            — agent выдал ответ без tool_calls
-  - done        {iterations}       — граф достиг END
-  - error       {code, message}    — exception или превышен MAX_ITER
+Event types:
+  - clarify      {thread_id, interpretation, original, round} — пауза подтверждения
+  - node_start   {node}
+  - tool_call    {name, args, id}
+  - tool_result  {name, id, result}
+  - final_answer {text}
+  - done         {iterations}
+  - error        {code, message}
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import AsyncIterator
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langgraph.types import Command
 
 from agent.config import MAX_ITER
 from agent.graph import build_graph
@@ -26,8 +28,6 @@ from agent.graph import build_graph
 
 @dataclass
 class AgentRun:
-    """Результат полного прогона графа (non-streaming режим). Trace —
-    плоский список dict'ов (тех же что в SSE-events)."""
     answer: str
     trace: list[dict] = field(default_factory=list)
     iterations: int = 0
@@ -41,9 +41,6 @@ def _event(type_: str, data: dict) -> dict:
     return {"type": type_, "timestamp": _now_iso(), "data": data}
 
 
-# Модульный singleton — graph stateless (state per-invocation в astream),
-# а build_graph() тяжёлый: создаёт ChatOpenAI, биндит tools, компилирует
-# StateGraph. Пересоздавать на каждый запрос — лишний оверхед.
 _graph = None
 
 
@@ -54,32 +51,65 @@ def _get_graph():
     return _graph
 
 
-async def _astream_events(query: str) -> AsyncIterator[dict]:
-    """Внутренний async-генератор: yield'ит dict-events по мере
-    выполнения графа. НЕ форматирует SSE — это делает Web-слой."""
-    graph = _get_graph()
-    iterations = 0
-    stream = graph.astream(
-        {"messages": [HumanMessage(query)]},
-        stream_mode="updates",
-    )
+async def _astream_events(
+    thread_id: str,
+    *,
+    query: str | None = None,
+    resume: dict | None = None,
+    graph=None,
+) -> AsyncIterator[dict]:
+    """Async-генератор dict-events. Старт (query) или возобновление (resume).
+    graph — для инъекции в тестах; по умолчанию singleton."""
+    graph = graph if graph is not None else _get_graph()
+    config = {"configurable": {"thread_id": thread_id}}
 
+    if resume is not None:
+        stream_input = Command(resume=resume)
+    else:
+        stream_input = {"messages": [HumanMessage(query or "")]}
+
+    iterations = 0
+    # Ранний фидбек. interpret_node делает медленный LLM-вызов, а при
+    # stream_mode="updates" его node_start пришёл бы только ПОСЛЕ завершения
+    # (~25-45с на медленной локальной модели) — всё это время UI выглядит
+    # зависшим. Эмитим node_start заранее, чтобы прогресс был виден сразу.
+    # Только на старте turn'а: на resume первым идёт confirm/agent, не interpret.
+    pre_announced_interpret = resume is None
+    if pre_announced_interpret:
+        yield _event("node_start", {"node": "interpret"})
+
+    stream = graph.astream(stream_input, config, stream_mode="updates")
     try:
-        # stream_mode="updates" даёт {node_name: state_delta} после каждого узла.
         async for update in stream:
-            # Guard ДО обработки очередного апдейта — иначе MAX_ITER+1-я
-            # итерация уже выполнилась внутри графа когда мы её ловим.
-            if iterations >= MAX_ITER:
-                yield _event("error", {
-                    "code": "max_iter",
-                    "message": f"Превышен лимит итераций ({MAX_ITER})",
-                })
+            # interrupt() — пауза подтверждения. Эмитим clarify и выходим:
+            # граф сохранён в checkpointer, продолжим на resume.
+            if "__interrupt__" in update:
+                payload = update["__interrupt__"][0].value
+                yield _event("clarify", {"thread_id": thread_id, **payload})
                 return
-            iterations += 1
+
+            # Лимит и счётчик «итераций» относятся к ReAct-циклу (agent/tools),
+            # а не к clarify-фазе (interpret/confirm) — иначе «Готово (итераций: N)»
+            # завышается, а бюджет MAX_ITER съедается узлами подтверждения.
+            is_react = any(n in ("agent", "tools") for n in update)
+            if is_react:
+                if iterations >= MAX_ITER:
+                    yield _event("error", {
+                        "code": "max_iter",
+                        "message": f"Превышен лимит итераций ({MAX_ITER})",
+                    })
+                    return
+                iterations += 1
 
             for node_name, delta in update.items():
+                # interpret уже анонсировали заранее (ранний фидбек) — не
+                # дублируем его шаг. У interpret нет messages, так что
+                # пропускаем весь блок узла.
+                if node_name == "interpret" and pre_announced_interpret:
+                    pre_announced_interpret = False
+                    continue
                 yield _event("node_start", {"node": node_name})
-                new_messages = delta.get("messages") or []
+                new_messages = (delta or {}).get("messages") or []
                 for msg in new_messages:
                     if isinstance(msg, AIMessage):
                         tool_calls = msg.tool_calls or []
@@ -91,14 +121,8 @@ async def _astream_events(query: str) -> AsyncIterator[dict]:
                                     "id": tc["id"],
                                 })
                         else:
-                            yield _event("final_answer", {
-                                "text": msg.content or "",
-                            })
+                            yield _event("final_answer", {"text": msg.content or ""})
                     elif isinstance(msg, ToolMessage):
-                        # ToolMessage.content — строка (JSON-сериализованный
-                        # результат tool'а). Пытаемся распарсить обратно
-                        # для красивого отображения; если не парсится —
-                        # отдаём как есть.
                         result: object = msg.content
                         try:
                             result = json.loads(msg.content)
@@ -113,31 +137,45 @@ async def _astream_events(query: str) -> AsyncIterator[dict]:
         yield _event("done", {"iterations": iterations})
 
     except Exception as exc:
-        yield _event("error", {
-            "code": type(exc).__name__,
-            "message": str(exc),
-        })
+        yield _event("error", {"code": type(exc).__name__, "message": str(exc)})
+    finally:
+        # Детерминированно закрываем подлежащий astream. Без этого ранний
+        # `return` (clarify-пауза, max_iter) оставляет недослитый генератор
+        # и pending callback-таски LangChain — в долгоживущем сервере это
+        # копилось бы на каждый turn с подтверждением.
+        await stream.aclose()
 
 
-async def run_collect(query: str) -> AgentRun:
-    """Прогнать граф без стриминга — собрать trace и финальный ответ.
-    Используется в `POST /api/agent/ask`."""
+async def run_collect(query: str, thread_id: str = "collect") -> AgentRun:
+    """Non-streaming прогон для POST /api/agent/ask. Интерактивного
+    подтверждения нет — авто-принимаем первую интерпретацию."""
     trace: list[dict] = []
     answer = ""
     iterations = 0
-    async for event in _astream_events(query):
-        trace.append(event)
-        if event["type"] == "final_answer":
-            answer = event["data"]["text"]
-        elif event["type"] == "done":
-            iterations = event["data"]["iterations"]
-        elif event["type"] == "error":
-            answer = answer or f"Ошибка: {event['data']['message']}"
+    pending: dict | None = {"query": query}
+    # Цикл: старт → если clarify, авто-resume confirmed=True → до done/error.
+    while pending is not None:
+        if "query" in pending:
+            gen = _astream_events(thread_id, query=pending["query"])
+        else:
+            gen = _astream_events(thread_id, resume=pending["resume"])
+        pending = None
+        async for event in gen:
+            trace.append(event)
+            if event["type"] == "clarify":
+                pending = {"resume": {"confirmed": True, "correction": None}}
+            elif event["type"] == "final_answer":
+                answer = event["data"]["text"]
+            elif event["type"] == "done":
+                iterations = event["data"]["iterations"]
+            elif event["type"] == "error":
+                answer = answer or f"Ошибка: {event['data']['message']}"
     return AgentRun(answer=answer, trace=trace, iterations=iterations)
 
 
-async def run_stream(query: str) -> AsyncIterator[dict]:
-    """Прогнать граф стримом — yield'ить events по мере появления.
-    Используется в `GET /api/agent/ask/stream`."""
-    async for event in _astream_events(query):
+async def run_stream(
+    thread_id: str, *, query: str | None = None, resume: dict | None = None
+) -> AsyncIterator[dict]:
+    """Стрим events для GET-эндпоинтов (старт или resume)."""
+    async for event in _astream_events(thread_id, query=query, resume=resume):
         yield event

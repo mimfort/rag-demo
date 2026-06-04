@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Как работает твой LangGraph-агент</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,900&family=IBM+Plex+Mono:wght@400;500;600&family=Spline+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --ink:#0d1117;
+    --ink-2:#121922;
+    --panel:#161e29;
+    --line:#27323f;
+    --line-bright:#3a4858;
+    --paper:#e9e2d0;
+    --paper-dim:#a9a395;
+    --amber:#f0a843;
+    --amber-soft:#f5c478;
+    --cyan:#4fd1c5;
+    --rose:#f06a6a;
+    --violet:#9d8cff;
+    --grid:rgba(120,140,160,.05);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{
+    background:var(--ink);
+    color:var(--paper);
+    font-family:'Spline Sans',sans-serif;
+    line-height:1.7;
+    font-size:17px;
+    overflow-x:hidden;
+    background-image:
+      linear-gradient(var(--grid) 1px,transparent 1px),
+      linear-gradient(90deg,var(--grid) 1px,transparent 1px);
+    background-size:32px 32px;
+  }
+  ::selection{background:var(--amber);color:var(--ink)}
+  .wrap{max-width:920px;margin:0 auto;padding:0 24px}
+
+  /* ---------- HERO ---------- */
+  header{
+    position:relative;padding:120px 0 80px;text-align:center;
+    border-bottom:1px solid var(--line);
+    background:radial-gradient(ellipse 80% 60% at 50% 0%,rgba(240,168,67,.10),transparent 70%);
+  }
+  .kicker{
+    font-family:'IBM Plex Mono',monospace;font-size:12px;letter-spacing:.35em;
+    text-transform:uppercase;color:var(--amber);margin-bottom:28px;
+    opacity:0;animation:fade .8s .1s forwards;
+  }
+  header h1{
+    font-family:'Fraunces',serif;font-weight:900;font-size:clamp(40px,8vw,78px);
+    line-height:1.02;letter-spacing:-.02em;
+    opacity:0;animation:rise .9s .25s forwards;
+  }
+  header h1 em{font-style:italic;color:var(--amber)}
+  header p{
+    max-width:560px;margin:28px auto 0;color:var(--paper-dim);font-size:18px;
+    opacity:0;animation:rise .9s .45s forwards;
+  }
+  .scroll-hint{
+    margin-top:54px;font-family:'IBM Plex Mono',monospace;font-size:12px;
+    color:var(--paper-dim);letter-spacing:.2em;
+    opacity:0;animation:fade 1s 1s forwards;
+  }
+  .scroll-hint span{display:inline-block;animation:bob 1.8s ease-in-out infinite}
+
+  /* ---------- SECTIONS ---------- */
+  section{padding:84px 0;border-bottom:1px solid var(--line)}
+  .sec-num{
+    font-family:'IBM Plex Mono',monospace;font-size:13px;color:var(--amber);
+    letter-spacing:.2em;display:block;margin-bottom:14px;
+  }
+  h2{
+    font-family:'Fraunces',serif;font-weight:600;font-size:clamp(28px,5vw,44px);
+    line-height:1.1;letter-spacing:-.01em;margin-bottom:24px;
+  }
+  h2 em{font-style:italic;color:var(--amber-soft)}
+  h3{font-family:'Fraunces',serif;font-weight:600;font-size:24px;margin:36px 0 12px}
+  p{margin-bottom:18px;color:#d4ccba}
+  strong{color:var(--paper);font-weight:600}
+  .lead{font-size:19px;color:var(--paper)}
+  a{color:var(--amber);text-decoration:none;border-bottom:1px solid rgba(240,168,67,.3)}
+
+  /* analogy callout */
+  .analogy{
+    border-left:3px solid var(--cyan);background:rgba(79,209,197,.06);
+    padding:18px 22px;border-radius:0 8px 8px 0;margin:24px 0;font-size:16px;
+  }
+  .analogy b{color:var(--cyan)}
+
+  /* two-column comparison */
+  .vs{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin:32px 0}
+  @media(max-width:680px){.vs{grid-template-columns:1fr}}
+  .card{
+    background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:26px;position:relative;overflow:hidden;
+  }
+  .card::before{content:"";position:absolute;inset:0 0 auto 0;height:3px}
+  .card.chain::before{background:var(--cyan)}
+  .card.graph::before{background:var(--amber)}
+  .card .tag{
+    font-family:'IBM Plex Mono',monospace;font-size:12px;letter-spacing:.15em;
+    text-transform:uppercase;margin-bottom:10px;
+  }
+  .card.chain .tag{color:var(--cyan)}
+  .card.graph .tag{color:var(--amber)}
+  .card h4{font-family:'Fraunces',serif;font-size:21px;margin-bottom:10px}
+  .card p{font-size:15px;margin-bottom:0;color:var(--paper-dim)}
+
+  /* code blocks */
+  .code{
+    background:#0a0e14;border:1px solid var(--line);border-radius:10px;
+    font-family:'IBM Plex Mono',monospace;font-size:13.5px;line-height:1.7;
+    margin:20px 0;overflow:hidden;
+  }
+  .code .bar{
+    background:#11161f;border-bottom:1px solid var(--line);padding:8px 14px;
+    font-size:11px;letter-spacing:.1em;color:var(--paper-dim);display:flex;gap:8px;align-items:center;
+  }
+  .code .bar .dot{width:9px;height:9px;border-radius:50%;background:var(--line-bright)}
+  .code .bar .file{margin-left:auto;color:#6b7785}
+  .code pre{padding:16px 18px;overflow-x:auto}
+  .c-kw{color:var(--violet)}     /* keyword */
+  .c-fn{color:var(--amber-soft)} /* function */
+  .c-str{color:var(--cyan)}      /* string */
+  .c-com{color:#5d6b7a;font-style:italic} /* comment */
+  .c-cls{color:#7fd88f}          /* class/type */
+  .c-dec{color:var(--rose)}      /* decorator */
+
+  /* glossary chips */
+  .chips{display:flex;flex-wrap:wrap;gap:10px;margin:24px 0}
+  .chip{
+    font-family:'IBM Plex Mono',monospace;font-size:13px;background:var(--ink-2);
+    border:1px solid var(--line-bright);padding:7px 13px;border-radius:30px;color:var(--paper-dim);
+  }
+  .chip b{color:var(--amber-soft)}
+
+  /* message-type list */
+  .msgs{display:grid;gap:12px;margin:24px 0}
+  .msg{
+    display:grid;grid-template-columns:140px 1fr;gap:18px;align-items:center;
+    background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 18px;
+  }
+  @media(max-width:680px){.msg{grid-template-columns:1fr;gap:6px}}
+  .msg .name{font-family:'IBM Plex Mono',monospace;font-size:14px;font-weight:600}
+  .msg .d{font-size:14px;color:var(--paper-dim)}
+  .msg.sys .name{color:var(--violet)}
+  .msg.hum .name{color:var(--cyan)}
+  .msg.ai .name{color:var(--amber)}
+  .msg.tool .name{color:#7fd88f}
+
+  /* ---------- GRAPH DIAGRAM ---------- */
+  .diagram{
+    background:var(--ink-2);border:1px solid var(--line);border-radius:16px;
+    padding:36px 20px;margin:32px 0;position:relative;
+  }
+  .diagram .legend{
+    display:flex;gap:20px;flex-wrap:wrap;justify-content:center;margin-top:24px;
+    font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--paper-dim);
+  }
+  .legend i{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:6px;vertical-align:middle}
+  .play-row{display:flex;justify-content:center;gap:12px;margin-top:8px;flex-wrap:wrap}
+  .btn{
+    font-family:'IBM Plex Mono',monospace;font-size:13px;cursor:pointer;
+    background:var(--amber);color:var(--ink);border:none;padding:11px 22px;border-radius:30px;
+    font-weight:600;letter-spacing:.05em;transition:transform .15s,box-shadow .15s;
+  }
+  .btn:hover{transform:translateY(-2px);box-shadow:0 6px 20px rgba(240,168,67,.3)}
+  .btn.ghost{background:transparent;color:var(--paper-dim);border:1px solid var(--line-bright)}
+  .btn.ghost:hover{box-shadow:none;color:var(--paper)}
+
+  /* svg node states */
+  .node-box{fill:var(--panel);stroke:var(--line-bright);stroke-width:1.5;transition:all .4s}
+  .node-box.active{fill:rgba(240,168,67,.18);stroke:var(--amber);stroke-width:2.5;filter:drop-shadow(0 0 14px rgba(240,168,67,.5))}
+  .node-box.tools.active{fill:rgba(127,216,143,.18);stroke:#7fd88f;filter:drop-shadow(0 0 14px rgba(127,216,143,.5))}
+  .node-label{font-family:'IBM Plex Mono',monospace;font-size:15px;font-weight:600;fill:var(--paper);text-anchor:middle;dominant-baseline:middle}
+  .term{font-family:'IBM Plex Mono',monospace;font-size:12px;fill:var(--paper-dim);text-anchor:middle;dominant-baseline:middle}
+  .edge{stroke:var(--line-bright);stroke-width:2;fill:none;transition:all .4s}
+  .edge.active{stroke:var(--amber);stroke-width:3;filter:drop-shadow(0 0 6px rgba(240,168,67,.6))}
+  .edge.active.tool{stroke:#7fd88f;filter:drop-shadow(0 0 6px rgba(127,216,143,.6))}
+  .edge-label{font-family:'IBM Plex Mono',monospace;font-size:11px;fill:var(--paper-dim);text-anchor:middle}
+  .edge-label.cond{fill:var(--amber-soft)}
+
+  /* step narration */
+  .narration{
+    background:#0a0e14;border:1px solid var(--line);border-radius:10px;padding:18px 20px;
+    margin-top:20px;min-height:88px;font-family:'IBM Plex Mono',monospace;font-size:14px;
+  }
+  .narration .step-no{color:var(--amber);font-weight:600}
+  .narration .step-txt{color:#d4ccba;margin-top:6px;display:block;line-height:1.6}
+  .narration .idle{color:var(--paper-dim)}
+
+  /* state.messages panel */
+  .state-panel{
+    background:#0a0e14;border:1px solid var(--line);border-radius:10px;
+    margin-top:14px;overflow:hidden;
+  }
+  .sp-head{
+    font-family:'IBM Plex Mono',monospace;font-size:12px;letter-spacing:.12em;
+    text-transform:uppercase;color:var(--paper-dim);padding:10px 16px;
+    border-bottom:1px solid var(--line);background:#11161f;
+  }
+  .sp-head span{color:var(--amber)}
+  .sp-list{list-style:none;padding:10px 14px;min-height:54px;display:grid;gap:7px}
+  .sp-list li{
+    font-family:'IBM Plex Mono',monospace;font-size:13px;display:flex;gap:10px;align-items:baseline;
+    opacity:0;transform:translateX(-10px);animation:slidein .35s forwards;
+  }
+  .sp-list li .badge{
+    font-size:11px;padding:2px 8px;border-radius:5px;font-weight:600;flex-shrink:0;min-width:104px;text-align:center;
+  }
+  .sp-list li.b-hum .badge{background:rgba(79,209,197,.18);color:var(--cyan)}
+  .sp-list li.b-ai  .badge{background:rgba(240,168,67,.18);color:var(--amber)}
+  .sp-list li.b-tool .badge{background:rgba(127,216,143,.18);color:#7fd88f}
+  .sp-list li .txt{color:#c8c0ae}
+  @keyframes slidein{to{opacity:1;transform:none}}
+
+  /* step dots */
+  .step-track{display:flex;gap:8px;justify-content:center;margin-top:18px}
+  .step-track .d{
+    width:30px;height:5px;border-radius:3px;background:var(--line-bright);transition:all .3s;cursor:pointer;
+  }
+  .step-track .d.done{background:var(--amber-soft)}
+  .step-track .d.cur{background:var(--amber);box-shadow:0 0 10px rgba(240,168,67,.6)}
+
+  /* numbered walkthrough */
+  .steps{counter-reset:s;margin:28px 0;display:grid;gap:14px}
+  .step{
+    display:grid;grid-template-columns:48px 1fr;gap:18px;align-items:start;
+    background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px 20px;
+  }
+  .step::before{
+    counter-increment:s;content:counter(s);
+    font-family:'Fraunces',serif;font-weight:900;font-size:24px;color:var(--amber);
+    width:44px;height:44px;border:1.5px solid var(--line-bright);border-radius:50%;
+    display:flex;align-items:center;justify-content:center;
+  }
+  .step .st{font-size:15px;color:#d4ccba}
+  .step .st b{color:var(--paper)}
+  .step .st code{font-family:'IBM Plex Mono',monospace;font-size:13px;background:var(--ink);padding:2px 6px;border-radius:4px;color:var(--amber-soft)}
+
+  /* detail notes */
+  .note{
+    display:grid;grid-template-columns:auto 1fr;gap:14px;align-items:start;
+    border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin:14px 0;background:var(--panel);
+  }
+  .note .ic{font-size:20px}
+  .note .t{font-size:15px;color:var(--paper-dim)}
+  .note .t b{color:var(--paper)}
+
+  /* TL;DR */
+  .tldr{
+    background:linear-gradient(135deg,rgba(240,168,67,.12),rgba(79,209,197,.06));
+    border:1px solid var(--line-bright);border-radius:16px;padding:38px 32px;margin:8px 0;
+  }
+  .tldr h2{margin-bottom:14px}
+  .tldr p{font-size:19px;color:var(--paper);margin-bottom:0;line-height:1.6}
+  .tldr .hl-chain{color:var(--cyan);font-weight:600}
+  .tldr .hl-graph{color:var(--amber);font-weight:600}
+
+  footer{padding:60px 0 80px;text-align:center;color:var(--paper-dim);font-family:'IBM Plex Mono',monospace;font-size:13px}
+
+  /* reveal on scroll */
+  .reveal{opacity:0;transform:translateY(24px);transition:opacity .7s,transform .7s}
+  .reveal.in{opacity:1;transform:none}
+
+  @keyframes fade{to{opacity:1}}
+  @keyframes rise{to{opacity:1;transform:none}}
+  @keyframes bob{0%,100%{transform:translateY(0)}50%{transform:translateY(6px)}}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="kicker">RAG · СКК Рондо · agent/</div>
+  <h1>Как работает<br>твой <em>LangGraph</em>-агент</h1>
+  <p>Разбор с нуля — на твоём собственном коде. От кирпичиков LangChain до анимированного цикла рассуждений.</p>
+  <div class="scroll-hint"><span>↓ листай вниз</span></div>
+</header>
+
+<!-- 0 -->
+<section>
+  <div class="wrap reveal">
+    <span class="sec-num">00 — ОРИЕНТИРЫ</span>
+    <h2>Две библиотеки, <em>а не одна</em></h2>
+    <p class="lead">LangChain и LangGraph — разные инструменты от одних авторов. Их легко путать, но роли у них чёткие.</p>
+
+    <div class="vs">
+      <div class="card chain">
+        <div class="tag">⬡ LangChain</div>
+        <h4>Кирпичики</h4>
+        <p>Единый язык общения с LLM: модель, сообщения, инструменты, парсеры. Это <b>словарь</b> для разговора с моделью.</p>
+      </div>
+      <div class="card graph">
+        <div class="tag">⬢ LangGraph</div>
+        <h4>Сценарий</h4>
+        <p>Поверх LangChain. Описывает управляющую логику агента как граф и крутит цикл «думай → действуй». Это <b>режиссёр</b>, который двигает кирпичики.</p>
+      </div>
+    </div>
+
+    <div class="analogy">
+      <b>Аналогия для программиста.</b> LangChain — это функции и типы данных. LangGraph — это <code>while</code>-цикл со <code>state</code>, который эти функции вызывает в нужном порядке.
+    </div>
+  </div>
+</section>
+
+<!-- 1 -->
+<section>
+  <div class="wrap reveal">
+    <span class="sec-num">01 — КИРПИЧИКИ LANGCHAIN</span>
+    <h2>Сообщения, модель, инструменты</h2>
+    <p>Вся переписка с моделью — это не строки, а список объектов-сообщений. У тебя в коде встречаются четыре типа:</p>
+
+    <div class="msgs">
+      <div class="msg sys"><span class="name">SystemMessage</span><span class="d">Инструкция модели — твой системный промпт «Ты помощник СКК Рондо…»</span></div>
+      <div class="msg hum"><span class="name">HumanMessage</span><span class="d">Вопрос пользователя</span></div>
+      <div class="msg ai"><span class="name">AIMessage</span><span class="d">Ответ модели. Внутри либо текст <code>.content</code>, либо просьба вызвать инструмент <code>.tool_calls</code></span></div>
+      <div class="msg tool"><span class="name">ToolMessage</span><span class="d">Результат выполнения инструмента — кладётся обратно в историю</span></div>
+    </div>
+
+    <h3>Модель — единый интерфейс</h3>
+    <p>Твоя модель крутится локально в LM Studio. Но раз она «OpenAI-совместимая», LangChain позволяет подключить её той же обёрткой <code>ChatOpenAI</code> — меняется только <code>base_url</code>. Остальной код не знает, что это не настоящий OpenAI.</p>
+
+    <div class="code">
+      <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="file">agent/llm.py</span></div>
+      <pre><span class="c-kw">return</span> <span class="c-fn">ChatOpenAI</span>(
+    model=rag_settings.chat_model,
+    base_url=rag_settings.lm_studio_base_url,  <span class="c-com"># ← вся «магия» подмены</span>
+    api_key=rag_settings.lm_studio_api_key,
+    temperature=<span class="c-str">0.2</span>,  <span class="c-com"># стабильный tool-calling, не креатив</span>
+    max_retries=<span class="c-str">1</span>,
+)</pre>
+    </div>
+
+    <h3>Инструменты — функция превращается в tool</h3>
+    <p>Декоратор <code>@tool</code> делает из обычной функции инструмент. Самое неочевидное: LangChain <strong>автоматически</strong> читает имя, типы аргументов и <strong>docstring</strong> — и превращает их в JSON-описание для модели.</p>
+
+    <div class="code">
+      <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="file">agent/tools.py</span></div>
+      <pre><span class="c-dec">@tool</span>
+<span class="c-kw">async def</span> <span class="c-fn">get_weather</span>(date: <span class="c-cls">str</span>) -&gt; <span class="c-cls">dict</span>:
+    <span class="c-str">"""Получить прогноз погоды на дату в формате YYYY-MM-DD.</span>
+<span class="c-str">    Возвращает {date, temperature_c, condition, sunny, raw} либо {error}."""</span>
+    ...</pre>
+    </div>
+
+    <div class="note">
+      <span class="ic">💡</span>
+      <span class="t"><b>Docstring — это не комментарий, а инструкция для модели.</b> Модель читает именно его, чтобы понять, когда и как звать инструмент. Поэтому он у тебя такой подробный — by design.</span>
+    </div>
+
+    <h3>bind_tools — «прикрепить» инструменты к модели</h3>
+    <p>После <code>bind_tools</code> модель при каждом вызове видит описания инструментов и <strong>может</strong> вместо текста вернуть <code>tool_calls</code> — структурированную просьбу «вызови <code>get_weather</code> с <code>date="2026-06-01"</code>».</p>
+
+    <div class="note">
+      <span class="ic">⚠️</span>
+      <span class="t"><b>Модель сама инструмент не выполняет.</b> Она только <i>просит</i>. Выполняет код (узел <code>tools</code>). Это ключевое разделение — запомни его для следующей секции.</span>
+    </div>
+  </div>
+</section>
+
+<!-- 2 -->
+<section>
+  <div class="wrap reveal">
+    <span class="sec-num">02 — ИЗ ЧЕГО СОСТОИТ ГРАФ</span>
+    <h2>State, узлы, рёбра</h2>
+    <p class="lead">LangGraph держится на трёх понятиях. Разберём каждое на твоём <code>agent/graph.py</code>.</p>
+
+    <h3>① State — общая память, которая течёт через граф</h3>
+    <div class="code">
+      <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="file">agent/state.py</span></div>
+      <pre><span class="c-kw">class</span> <span class="c-cls">AgentState</span>(<span class="c-cls">TypedDict</span>):
+    messages: <span class="c-cls">Annotated</span>[<span class="c-cls">list</span>[<span class="c-cls">BaseMessage</span>], <span class="c-fn">add_messages</span>]</pre>
+    </div>
+    <p>State — словарь, который проходит через весь граф. У тебя одно поле — <code>messages</code> (вся история). Магия в <code>add_messages</code>: это <strong>reducer</strong> — правило обновления. Когда узел возвращает <code>{"messages": [новое]}</code>, список <strong>дописывается</strong>, а не заменяется.</p>
+    <div class="note">
+      <span class="ic">🧩</span>
+      <span class="t"><b>Без этого reducer'а каждый узел стирал бы историю.</b> Именно поэтому узлы возвращают список из одного сообщения, а в state их накапливается много.</span>
+    </div>
+
+    <h3>② Узлы — функции, которые что-то делают</h3>
+    <div class="chips">
+      <span class="chip"><b>agent</b> — зовёт LLM</span>
+      <span class="chip"><b>tools</b> — выполняет инструменты</span>
+    </div>
+    <p><b>agent</b> берёт <code>messages</code>, при нужде добавляет system-промпт в начало, вызывает модель, возвращает её ответ. <b>tools</b> — <strong>готовый</strong> узел <code>ToolNode(TOOLS)</code>: смотрит на <code>tool_calls</code> в последнем ответе, сам вызывает твои функции и кладёт результаты как <code>ToolMessage</code>. Диспетчер «если имя == get_weather…» писать не нужно.</p>
+
+    <h3>③ Рёбра — куда идти дальше</h3>
+    <div class="code">
+      <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="file">agent/graph.py</span></div>
+      <pre>graph.<span class="c-fn">set_entry_point</span>(<span class="c-str">"agent"</span>)              <span class="c-com"># входим в agent</span>
+graph.<span class="c-fn">add_conditional_edges</span>(<span class="c-str">"agent"</span>, tools_condition)  <span class="c-com"># РАЗВИЛКА</span>
+graph.<span class="c-fn">add_edge</span>(<span class="c-str">"tools"</span>, <span class="c-str">"agent"</span>)          <span class="c-com"># ВСЕГДА назад в agent</span></pre>
+    </div>
+    <p><code>tools_condition</code> — готовая функция: смотрит на последний <code>AIMessage</code> и возвращает <code>"tools"</code> если есть <code>tool_calls</code>, иначе <code>END</code> (модель ответила текстом — выходим).</p>
+  </div>
+</section>
+
+<!-- 3 — ANIMATED DIAGRAM -->
+<section>
+  <div class="wrap reveal">
+    <span class="sec-num">03 — ЖИВАЯ СХЕМА</span>
+    <h2>ReAct-цикл <em>в движении</em></h2>
+    <p>Это и есть весь агент. Нажми «Запустить» — пройдём один реальный вопрос по шагам: <i>«будет ли солнечно завтра и свободны ли корты?»</i></p>
+
+    <div class="diagram">
+      <svg id="graph-svg" viewBox="0 0 720 320" width="100%" style="max-height:340px">
+        <!-- edges -->
+        <path id="e-start"  class="edge" d="M120,60 L120,110"/>
+        <path id="e-cond"   class="edge" d="M120,160 L120,250"/>      <!-- agent -> END (down) -->
+        <path id="e-toagent" class="edge tool" d="M520,135 L300,135"/> <!-- tools -> agent -->
+        <path id="e-totools" class="edge" d="M340,110 L560,110"/>     <!-- agent -> tools -->
+
+        <!-- edge labels -->
+        <text class="edge-label cond" x="158" y="208">нет tool_calls → END</text>
+        <text class="edge-label cond" x="430" y="100">есть tool_calls</text>
+        <text class="edge-label" x="410" y="152">результат → назад</text>
+
+        <!-- START -->
+        <circle cx="120" cy="45" r="16" fill="none" stroke="var(--line-bright)" stroke-width="1.5"/>
+        <text class="term" x="120" y="45">START</text>
+
+        <!-- agent node -->
+        <rect id="n-agent" class="node-box" x="40" y="110" width="200" height="50" rx="10"/>
+        <text class="node-label" x="140" y="135">agent · LLM</text>
+
+        <!-- tools node -->
+        <rect id="n-tools" class="node-box tools" x="560" y="110" width="120" height="50" rx="10"/>
+        <text class="node-label" x="620" y="135">tools</text>
+
+        <!-- END -->
+        <rect id="n-end" class="node-box" x="80" y="250" width="80" height="40" rx="20"/>
+        <text class="term" x="120" y="270">END</text>
+
+        <!-- arrowheads (simple) -->
+        <defs>
+          <marker id="ar" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="var(--line-bright)"/>
+          </marker>
+        </defs>
+      </svg>
+
+      <div class="narration" id="narration">
+        <span class="idle">▸ Граф в покое. Жми «Вперёд ▶» — шаг за шагом. Слева увидишь, как сообщения накапливаются в state.messages, а на схеме подсветится активный узел.</span>
+      </div>
+
+      <div class="state-panel">
+        <div class="sp-head">state.messages <span id="sp-count">— пусто</span></div>
+        <ul class="sp-list" id="sp-list"></ul>
+      </div>
+
+      <div class="step-track" id="dots"></div>
+
+      <div class="play-row">
+        <button class="btn ghost" id="prev">◀ Назад</button>
+        <button class="btn" id="next">Вперёд ▶</button>
+        <button class="btn ghost" id="auto">⏯ Авто</button>
+        <button class="btn ghost" id="reset">⟲ Сброс</button>
+      </div>
+
+      <div class="legend">
+        <span><i style="background:var(--amber)"></i>узел agent активен</span>
+        <span><i style="background:#7fd88f"></i>узел tools активен</span>
+        <span><i style="background:var(--line-bright)"></i>не активен</span>
+      </div>
+    </div>
+
+    <p style="font-size:14px;color:var(--paper-dim)">Паттерн «модель рассуждает → действует инструментом → смотрит результат → снова рассуждает» называется <strong>ReAct</strong> (Reasoning + Acting). LangGraph просто крутит его, пока модель не перестанет просить инструменты.</p>
+  </div>
+</section>
+
+<!-- 4 -->
+<section>
+  <div class="wrap reveal">
+    <span class="sec-num">04 — ПО ШАГАМ</span>
+    <h2>Тот же прогон <em>текстом</em></h2>
+    <div class="steps">
+      <div class="step"><div class="st"><b>Вход.</b> В граф передаётся <code>{"messages": [HumanMessage("…будет ли солнечно и свободны ли корты?")]}</code></div></div>
+      <div class="step"><div class="st"><b>Узел agent.</b> Модель видит вопрос + описания инструментов, понимает что нужны данные → возвращает <code>AIMessage</code> с двумя <code>tool_calls</code>. Текста нет.</div></div>
+      <div class="step"><div class="st"><b>Развилка.</b> <code>tools_condition</code> видит <code>tool_calls</code> → направляет в <code>tools</code>.</div></div>
+      <div class="step"><div class="st"><b>Узел tools.</b> <code>ToolNode</code> выполняет обе твои async-функции, ходит по HTTP в skkrondo API, кладёт два <code>ToolMessage</code> с результатами в state.</div></div>
+      <div class="step"><div class="st"><b>Ребро tools → agent.</b> Безусловно возвращаемся к модели.</div></div>
+      <div class="step"><div class="st"><b>Узел agent (снова).</b> Теперь модель видит вопрос <b>+ результаты инструментов</b>. Данных хватает → возвращает <code>AIMessage</code> с обычным текстом, без <code>tool_calls</code>.</div></div>
+      <div class="step"><div class="st"><b>Развилка → END.</b> <code>tool_calls</code> нет → граф завершён. Пользователь получает ответ.</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- 5 -->
+<section>
+  <div class="wrap reveal">
+    <span class="sec-num">05 — ЗАПУСК И СТРИМИНГ</span>
+    <h2>Как граф крутится — <em>runner.py</em></h2>
+    <p><code>graph.astream(..., stream_mode="updates")</code> запускает граф и <strong>по мере выполнения</strong> отдаёт обновления — после каждого узла прилетает <code>{имя_узла: что_добавлено_в_state}</code>.</p>
+
+    <div class="code">
+      <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="file">agent/runner.py</span></div>
+      <pre>stream = graph.<span class="c-fn">astream</span>(
+    {<span class="c-str">"messages"</span>: [<span class="c-fn">HumanMessage</span>(query)]},
+    stream_mode=<span class="c-str">"updates"</span>,
+)
+<span class="c-kw">async for</span> update <span class="c-kw">in</span> stream:        <span class="c-com"># {node_name: state_delta}</span>
+    ...                              <span class="c-com"># → SSE-события для фронта</span></pre>
+    </div>
+    <p>Твой <code>_astream_events</code> превращает эти обновления в события (<code>tool_call</code>, <code>tool_result</code>, <code>final_answer</code>), которые фронтенд показывает как timeline в реальном времени.</p>
+
+    <h3>Две инженерные детали в твоём коде</h3>
+    <div class="note">
+      <span class="ic">♻️</span>
+      <span class="t"><b>Singleton графа.</b> Граф собирается один раз на процесс — <code>build_graph()</code> тяжёлый (биндинг инструментов). State в графе не хранится, он живёт внутри каждого <code>astream</code>-вызова, поэтому переиспользовать безопасно.</span>
+    </div>
+    <div class="note">
+      <span class="ic">🛑</span>
+      <span class="t"><b>MAX_ITER.</b> Страховка от зацикливания: если модель будет бесконечно дёргать инструменты, цикл <code>agent ⇄ tools</code> оборвётся. Без лимита кривая логика модели могла бы крутиться вечно.</span>
+    </div>
+  </div>
+</section>
+
+<!-- TLDR -->
+<section style="border:none">
+  <div class="wrap reveal">
+    <div class="tldr">
+      <span class="sec-num">ИТОГ ОДНОЙ ФРАЗОЙ</span>
+      <h2>Соберём всё вместе</h2>
+      <p><span class="hl-chain">LangChain</span> даёт модель, сообщения и инструменты. <span class="hl-graph">LangGraph</span> связывает их в граф <code style="font-family:'IBM Plex Mono',monospace;color:var(--amber-soft)">agent ⇄ tools</code> со state-памятью и крутит ReAct-цикл, пока модель не выдаст финальный текстовый ответ.</p>
+    </div>
+  </div>
+</section>
+
+<footer>
+  agent/state.py · graph.py · tools.py · llm.py · runner.py &nbsp;·&nbsp; СКК «Рондо» RAG
+</footer>
+
+<script>
+// ---- reveal on scroll ----
+const io = new IntersectionObserver((es)=>{
+  es.forEach(e=>{ if(e.isIntersecting){ e.target.classList.add('in'); io.unobserve(e.target);} });
+},{threshold:.12});
+document.querySelectorAll('.reveal').forEach(el=>io.observe(el));
+
+// ---- animated graph ----
+const nAgent = document.getElementById('n-agent');
+const nTools = document.getElementById('n-tools');
+const nEnd   = document.getElementById('n-end');
+const eStart = document.getElementById('e-start');
+const eTotools = document.getElementById('e-totools');
+const eToagent = document.getElementById('e-toagent');
+const eCond  = document.getElementById('e-cond');
+const narr   = document.getElementById('narration');
+const prevBtn= document.getElementById('prev');
+const nextBtn= document.getElementById('next');
+const autoBtn= document.getElementById('auto');
+const resetBtn=document.getElementById('reset');
+const spList = document.getElementById('sp-list');
+const spCount= document.getElementById('sp-count');
+const dotsBox= document.getElementById('dots');
+
+// message snapshots: каждый шаг хранит ПОЛНОЕ состояние state.messages после него
+const M = {
+  hum:  {cls:'b-hum',  badge:'HumanMessage', txt:'«…солнечно завтра и свободны ли корты?»'},
+  aiTC: {cls:'b-ai',   badge:'AIMessage',    txt:'tool_calls: get_weather, get_courts_availability'},
+  twx:  {cls:'b-tool', badge:'ToolMessage',  txt:'get_weather → {sunny: true, temp: 24}'},
+  tcr:  {cls:'b-tool', badge:'ToolMessage',  txt:'get_courts → {summary: «корт 2 занят 18-19»}'},
+  aiTx: {cls:'b-ai',   badge:'AIMessage',    txt:'«Завтра солнечно, ~24°. Свободны все кроме корта 2…»'},
+};
+const steps = [
+  {n:'START', t:'В граф входит вопрос пользователя — один HumanMessage в state.messages.', on:[eStart], msgs:['hum']},
+  {n:'1 · узел agent', t:'Узел agent зовёт LLM. Данных ещё нет → модель возвращает AIMessage с двумя tool_calls. Он добавляется в state (reducer add_messages дописывает, не заменяет).', on:[nAgent], msgs:['hum','aiTC']},
+  {n:'2 · развилка', t:'tools_condition смотрит последний AIMessage: есть tool_calls → направляет управление в узел tools. Новых сообщений нет — это только маршрутизация.', on:[eTotools], msgs:['hum','aiTC']},
+  {n:'3 · узел tools', t:'ToolNode выполняет обе твои функции, ходит по HTTP в skkrondo API и кладёт 2 ToolMessage с результатами в state.', on:[nTools], msgs:['hum','aiTC','twx','tcr']},
+  {n:'4 · ребро tools → agent', t:'Безусловное ребро: возвращаемся к модели. Теперь в истории есть и вопрос, и результаты инструментов.', on:[eToagent], msgs:['hum','aiTC','twx','tcr']},
+  {n:'5 · узел agent (снова)', t:'Модель видит вопрос + результаты. Данных хватает → возвращает AIMessage с обычным текстом, БЕЗ tool_calls.', on:[nAgent], msgs:['hum','aiTC','twx','tcr','aiTx']},
+  {n:'6 · развилка → END', t:'tools_condition: tool_calls нет → END. Граф завершён, пользователь получает финальный ответ. ✅', on:[eCond,nEnd], msgs:['hum','aiTC','twx','tcr','aiTx']},
+];
+
+let cur=-1, timer=null;
+
+// построить точки-шаги
+steps.forEach((_,i)=>{
+  const d=document.createElement('div');
+  d.className='d';
+  d.addEventListener('click',()=>{stopAuto();goto(i);});
+  dotsBox.appendChild(d);
+});
+const dots=[...dotsBox.children];
+
+function clearGraph(){
+  [nAgent,nTools,nEnd].forEach(n=>n.classList.remove('active'));
+  [eStart,eTotools,eToagent,eCond].forEach(e=>e.classList.remove('active'));
+}
+
+function renderMsgs(keys){
+  spList.innerHTML='';
+  keys.forEach((k,idx)=>{
+    const m=M[k];
+    const li=document.createElement('li');
+    li.className=m.cls;
+    li.style.animationDelay=(idx*0.04)+'s';
+    li.innerHTML='<span class="badge">'+m.badge+'</span><span class="txt">'+m.txt+'</span>';
+    spList.appendChild(li);
+  });
+  spCount.textContent = keys.length ? '— '+keys.length+' сообщ.' : '— пусто';
+}
+
+function goto(i){
+  cur=i;
+  clearGraph();
+  const s=steps[i];
+  s.on.forEach(el=>el.classList.add('active'));
+  narr.innerHTML='<span class="step-no">'+s.n+'</span><span class="step-txt">'+s.t+'</span>';
+  renderMsgs(s.msgs);
+  dots.forEach((d,idx)=>{
+    d.classList.toggle('cur',idx===i);
+    d.classList.toggle('done',idx<i);
+  });
+  prevBtn.disabled = i<=0;
+  nextBtn.textContent = i>=steps.length-1 ? 'В начало ⟲' : 'Вперёд ▶';
+}
+
+function next(){
+  if(cur>=steps.length-1){ reset(true); return; }
+  goto(cur+1);
+}
+function prev(){ if(cur>0) goto(cur-1); }
+
+function reset(){
+  stopAuto();
+  cur=-1;
+  clearGraph();
+  spList.innerHTML='';
+  spCount.textContent='— пусто';
+  dots.forEach(d=>d.classList.remove('cur','done'));
+  prevBtn.disabled=true;
+  nextBtn.textContent='Вперёд ▶';
+  narr.innerHTML='<span class="idle">▸ Граф в покое. Жми «Вперёд ▶» — шаг за шагом. Слева увидишь, как сообщения накапливаются в state.messages, а на схеме подсветится активный узел.</span>';
+}
+
+function stopAuto(){
+  if(timer){clearInterval(timer);timer=null;autoBtn.textContent='⏯ Авто';}
+}
+function toggleAuto(){
+  if(timer){ stopAuto(); return; }
+  autoBtn.textContent='⏸ Пауза';
+  if(cur>=steps.length-1) cur=-1;
+  next();
+  timer=setInterval(()=>{
+    if(cur>=steps.length-1){ stopAuto(); return; }
+    goto(cur+1);
+  },2200);
+}
+
+prevBtn.addEventListener('click',()=>{stopAuto();prev();});
+nextBtn.addEventListener('click',()=>{stopAuto();next();});
+autoBtn.addEventListener('click',toggleAuto);
+resetBtn.addEventListener('click',reset);
+
+// клавиши ← →
+document.addEventListener('keydown',e=>{
+  if(e.key==='ArrowRight'){stopAuto();next();}
+  if(e.key==='ArrowLeft'){stopAuto();prev();}
+});
+
+reset();
+</script>
+</body>
+</html>

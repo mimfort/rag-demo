@@ -40,7 +40,9 @@ def _validate_date(value: str) -> str | None:
 
 # Условия в weather-API, которые мы считаем «солнечно». На реальной
 # структуре ответа skkrondo может быть лучше уточнить (см. /weather/weather/{date}).
-_SUNNY_KEYWORDS = ("ясно", "малооблачно", "солнечно", "clear", "sunny")
+_SUNNY_KEYWORDS = (
+    "ясно", "безоблачно", "малооблачно", "солнечно", "clear", "sunny",
+)
 
 
 def _classify_sunny(raw: dict) -> bool:
@@ -86,17 +88,53 @@ def _summarize_courts(raw: list) -> str:
     return "; ".join(parts)
 
 
+def _pick_day_forecast(forecast: list, valid: str) -> dict | None:
+    """Из почасового gismeteo-прогноза выбираем сводку по нужному дню.
+
+    gismeteo отдаёт весь массив сразу (без параметра date), время в UTC.
+    Берём все точки запрошенной даты, считаем диапазон температур и в
+    качестве «condition» — точку, ближайшую к полудню (12:00 UTC ≈ день).
+    None, если на эту дату данных нет (прогноз обычно ~4 дня вперёд).
+    """
+    day = [
+        e for e in forecast
+        if isinstance(e, dict) and str(e.get("date", ""))[:10] == valid
+    ]
+    if not day:
+        return None
+    temps = [e["temperature_C"] for e in day if e.get("temperature_C") is not None]
+
+    def _hour(e: dict) -> int:
+        try:
+            return int(str(e.get("date", ""))[11:13])
+        except ValueError:
+            return 0
+
+    midday = min(day, key=lambda e: abs(_hour(e) - 12))
+    return {
+        "temperature_c": midday.get("temperature_C"),
+        "temp_min_c": min(temps) if temps else None,
+        "temp_max_c": max(temps) if temps else None,
+        "condition": midday.get("description"),
+        "midday": midday,
+    }
+
+
 @tool
 async def get_weather(date: str) -> dict:
     """Получить прогноз погоды на конкретную дату в формате YYYY-MM-DD.
 
-    Возвращает: {date, temperature_c, condition, sunny: bool, raw}
-    либо {error: "..."} при сетевой/HTTP ошибке или невалидной дате.
+    Возвращает: {date, temperature_c, temp_min_c, temp_max_c, condition,
+    sunny: bool, raw} либо {error: "..."} при сетевой/HTTP ошибке,
+    невалидной дате или отсутствии данных на запрошенный день.
     """
     valid = _validate_date(date)
     if valid is None:
         return {"error": "invalid date: expected YYYY-MM-DD", "date": date}
-    url = f"{agent_settings.skkrondo_base_url}/weather/weather/{quote(valid, safe='')}"
+    # Эндпоинт /weather/weather/{date} стабильно отдаёт 500 (баг на стороне
+    # skkrondo), поэтому используем рабочий gismeteo: почасовой прогноз на
+    # ~4 дня вперёд, фильтруем по нужной дате на нашей стороне.
+    url = f"{agent_settings.skkrondo_base_url}/gismeteo/weather_gismeteo4/"
     try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SEC) as client:
             r = await client.get(url)
@@ -104,12 +142,21 @@ async def get_weather(date: str) -> dict:
             raw = r.json()
     except Exception as exc:
         return {"error": f"{type(exc).__name__}: {exc}", "date": valid}
+    forecast = raw.get("forecast") if isinstance(raw, dict) else None
+    summary = _pick_day_forecast(forecast or [], valid)
+    if summary is None:
+        return {
+            "error": "no forecast for this date (gismeteo даёт ~4 дня вперёд)",
+            "date": valid,
+        }
     return {
         "date": valid,
-        "temperature_c": raw.get("temperature") or raw.get("temp"),
-        "condition": raw.get("condition") or raw.get("description"),
-        "sunny": _classify_sunny(raw),
-        "raw": raw,
+        "temperature_c": summary["temperature_c"],
+        "temp_min_c": summary["temp_min_c"],
+        "temp_max_c": summary["temp_max_c"],
+        "condition": summary["condition"],
+        "sunny": _classify_sunny(summary["midday"]),
+        "raw": summary["midday"],
     }
 
 
