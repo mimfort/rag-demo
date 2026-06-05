@@ -15,7 +15,7 @@ retriever.py — оркестрирует шаг «Retrieval» в RAG.
 
 from __future__ import annotations
 
-from rag.embedder import LMStudioEmbedder
+from rag.embedder import Embedder
 from rag.vector_store import RetrievedChunk, VectorStore
 
 
@@ -24,7 +24,7 @@ class Retriever:
     Связывает Embedder и VectorStore. Сам ничего не хранит — это просто склейка.
     """
 
-    def __init__(self, embedder: LMStudioEmbedder, store: VectorStore) -> None:
+    def __init__(self, embedder: Embedder, store: VectorStore) -> None:
         self._embedder = embedder
         self._store = store
 
@@ -37,5 +37,5 @@ class Retriever:
         эмбеддить уже его), reranker (отдельной моделью переупорядочить
         top_k). Это типичные улучшения, но базовый RAG обходится без них.
         """
-        query_vec = self._embedder.embed_one(query)
+        query_vec = self._embedder.embed_query(query)
         return self._store.search(query_vec, top_k=top_k)
