@@ -80,6 +80,7 @@ export function AgentChat() {
       es.addEventListener("node_start", onEvent("node_start"));
       es.addEventListener("tool_call", onEvent("tool_call"));
       es.addEventListener("tool_result", onEvent("tool_result"));
+      es.addEventListener("verify", onEvent("verify"));
       es.addEventListener("final_answer", onEvent("final_answer"));
       es.addEventListener("done", onEvent("done"));
       es.addEventListener("error", (e) => {

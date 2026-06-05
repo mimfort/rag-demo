@@ -25,3 +25,10 @@ class AgentState(TypedDict, total=False):
     correction: str | None
     # Счётчик кругов clarify — гард против бесконечного цикла.
     clarify_rounds: int
+    # Verify-фаза (anti-hallucination): вердикт самопроверки финального ответа.
+    # verify_ok=True → END; False → возврат в agent на доработку.
+    verify_ok: bool
+    # Текст расхождения, найденного контролёром (для UI/трейса).
+    verify_issue: str | None
+    # Счётчик кругов verify — гард против бесконечного цикла доработок.
+    verify_rounds: int

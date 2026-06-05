@@ -7,6 +7,7 @@ Event types:
   - node_start   {node}
   - tool_call    {name, args, id}
   - tool_result  {name, id, result}
+  - verify       {ok, issue} — вердикт самопроверки финального ответа
   - final_answer {text}
   - done         {iterations}
   - error        {code, message}
@@ -109,6 +110,13 @@ async def _astream_events(
                     pre_announced_interpret = False
                     continue
                 yield _event("node_start", {"node": node_name})
+                # verify не несёт AI/Tool-сообщений для UI (корректирующий
+                # human-ход агент видит сам) — эмитим его вердикт отдельно.
+                if node_name == "verify":
+                    yield _event("verify", {
+                        "ok": bool((delta or {}).get("verify_ok")),
+                        "issue": (delta or {}).get("verify_issue"),
+                    })
                 new_messages = (delta or {}).get("messages") or []
                 for msg in new_messages:
                     if isinstance(msg, AIMessage):

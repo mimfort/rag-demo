@@ -77,7 +77,13 @@ def _summarize_courts(raw: list) -> str:
         if not isinstance(r, dict):
             continue
         court = r.get("court_id") or r.get("court", "?")
-        slot = f"{r.get('start_time', '?')}-{r.get('end_time', '?')}"
+        # У брони skkrondo один час начала (поле `time`, целое), без end_time —
+        # слоты часовые. Старый код читал start_time/end_time → выдавал "?-?".
+        t = r.get("time")
+        try:
+            slot = f"{int(t):02d}:00"
+        except (TypeError, ValueError):
+            slot = "?"
         by_court.setdefault(court, []).append(slot)
     if not by_court:
         return "Все корты свободны."

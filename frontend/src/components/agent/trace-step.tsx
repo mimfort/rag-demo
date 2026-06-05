@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { ChevronRight, Wrench, MessageSquare, Brain, CheckCircle2, AlertCircle, HelpCircle } from "lucide-react";
+import { ChevronRight, Wrench, MessageSquare, Brain, CheckCircle2, AlertCircle, HelpCircle, ShieldCheck, ShieldAlert } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { TraceEvent } from "@/lib/agent-types";
 
@@ -9,12 +9,13 @@ interface Props {
   event: TraceEvent;
 }
 
-function eventIcon(type: TraceEvent["type"]) {
-  switch (type) {
+function eventIcon(ev: TraceEvent) {
+  switch (ev.type) {
     case "clarify":      return HelpCircle;
     case "node_start":   return Brain;
     case "tool_call":    return Wrench;
     case "tool_result":  return CheckCircle2;
+    case "verify":       return ev.data.ok ? ShieldCheck : ShieldAlert;
     case "final_answer": return MessageSquare;
     case "done":         return CheckCircle2;
     case "error":        return AlertCircle;
@@ -33,6 +34,7 @@ function eventTitle(ev: TraceEvent): string {
       if (node === "agent") return "Думаю...";
       if (node === "interpret") return "Интерпретирую запрос…";
       if (node === "confirm") return "Уточнение";
+      if (node === "verify") return "Проверяю ответ…";
       return `Узел: ${node}`;
     }
     case "tool_call": {
@@ -50,28 +52,34 @@ function eventTitle(ev: TraceEvent): string {
       }
       return `${name} → готово`;
     }
+    case "verify": {
+      if (ev.data.ok) return "✅ Самопроверка пройдена";
+      const issue = ev.data.issue as string | null;
+      return `⚠️ Самопроверка: ${issue || "расхождение с данными"} — переписываю ответ`;
+    }
     case "final_answer": return "Финальный ответ";
     case "done":         return `Готово (итераций: ${ev.data.iterations})`;
     case "error":        return `Ошибка: ${ev.data.message}`;
   }
 }
 
-function eventColor(type: TraceEvent["type"]): string {
-  switch (type) {
+function eventColor(ev: TraceEvent): string {
+  switch (ev.type) {
     case "error":         return "text-red-400";
     case "final_answer":  return "text-primary";
     case "tool_call":     return "text-amber-400";
     case "tool_result":   return "text-emerald-400";
     case "clarify":       return "text-amber-400";
+    case "verify":        return ev.data.ok ? "text-emerald-400" : "text-amber-400";
     default:              return "text-muted-foreground";
   }
 }
 
 export function TraceStep({ event }: Props) {
   const [open, setOpen] = React.useState(false);
-  const Icon = eventIcon(event.type);
+  const Icon = eventIcon(event);
   const title = eventTitle(event);
-  const color = eventColor(event.type);
+  const color = eventColor(event);
 
   return (
     <div className="flex flex-col text-[11px]">

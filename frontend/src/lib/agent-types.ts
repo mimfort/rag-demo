@@ -8,6 +8,7 @@ export type AgentEventType =
   | "node_start"
   | "tool_call"
   | "tool_result"
+  | "verify"
   | "final_answer"
   | "done"
   | "error";

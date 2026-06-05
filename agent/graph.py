@@ -2,13 +2,18 @@
 Сборка LangGraph: clarify-фаза + ReAct-цикл.
 
 Структура:
-    START → interpret → confirm ──(да)──→ agent ⇄ tools → END
-                ↑                  │
-                └──────(нет)───────┘
+    START → interpret → confirm ──(да)──→ agent ⇄ tools
+                ↑                  │          │
+                └──────(нет)───────┘          ▼ (нет tool_call'ов)
+                                            verify ──(ok)──→ END
+                                              │
+                                              └──(расхождение)──→ agent
 
 - interpret: один LLM-вызов, перефразирует запрос (резолвит даты).
 - confirm:   interrupt() — пауза до подтверждения пользователя.
 - agent/tools: прежний ReAct-цикл, работает по подтверждённой формулировке.
+- verify:    самопроверка финального ответа против данных tool'ов
+             (anti-hallucination); при расхождении — возврат в agent.
 """
 
 from __future__ import annotations
@@ -17,15 +22,16 @@ from datetime import date
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import StateGraph
+from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.types import interrupt
 
 from agent.clarify import interpret_query
-from agent.config import MAX_CLARIFY_ROUNDS
+from agent.config import MAX_CLARIFY_ROUNDS, MAX_VERIFY_ROUNDS
 from agent.llm import make_llm
 from agent.state import AgentState
 from agent.tools import TOOLS
+from agent.verify import verify_answer
 
 
 SYSTEM_PROMPT_TEMPLATE = """Ты — помощник по СКК «Рондо». Ты можешь вызывать tools чтобы получить погоду и список забронированных кортов на конкретные даты.
@@ -47,6 +53,23 @@ def _original_query(state: AgentState) -> str:
         if m.type == "human":
             return m.content
     return ""
+
+
+def _final_answer_text(state: AgentState) -> str:
+    """Текст последнего AIMessage без tool_call'ов — финальный ответ агента."""
+    for m in reversed(state["messages"]):
+        if m.type == "ai" and not getattr(m, "tool_calls", None):
+            return m.content or ""
+    return ""
+
+
+def _collect_tool_results(state: AgentState) -> list[dict]:
+    """Все ToolMessage turn'а — сырьё, против которого верифицируем ответ."""
+    return [
+        {"name": getattr(m, "name", "") or "", "content": m.content}
+        for m in state["messages"]
+        if m.type == "tool"
+    ]
 
 
 def build_graph(plain_llm=None, agent_llm=None, checkpointer=None):
@@ -115,6 +138,39 @@ def build_graph(plain_llm=None, agent_llm=None, checkpointer=None):
         response = await agent_llm.ainvoke(messages)
         return {"messages": [response]}
 
+    async def verify_node(state: AgentState) -> dict:
+        rounds = state.get("verify_rounds", 0)
+        tool_results = _collect_tool_results(state)
+        # Нечего верифицировать (агент ответил без tool'ов) или исчерпан лимит
+        # доработок — пропускаем проверку, отдаём ответ как есть.
+        if not tool_results or rounds >= MAX_VERIFY_ROUNDS:
+            return {"verify_ok": True, "verify_issue": None}
+
+        query = state.get("effective_query") or _original_query(state)
+        answer = _final_answer_text(state)
+        ok, issue = await verify_answer(plain_llm, query, tool_results, answer)
+        if ok:
+            return {"verify_ok": True, "verify_issue": None}
+
+        # Расхождение: добавляем корректирующий human-ход и растим счётчик.
+        # route_after_verify уведёт обратно в agent — он перепишет ответ с
+        # этим фидбеком в контексте. Счётчик не даст зациклиться.
+        feedback = HumanMessage(
+            "Самопроверка нашла расхождение между твоим ответом и данными "
+            f"инструментов: {issue}. Перепиши ответ строго по полученным данным — "
+            "не добавляй температуру, даты, часы и слоты, которых нет в "
+            "результатах инструментов."
+        )
+        return {
+            "verify_ok": False,
+            "verify_issue": issue,
+            "verify_rounds": rounds + 1,
+            "messages": [feedback],
+        }
+
+    def route_after_verify(state: AgentState) -> str:
+        return END if state.get("verify_ok") else "agent"
+
     tool_node = ToolNode(TOOLS)
 
     graph = StateGraph(AgentState)
@@ -122,6 +178,7 @@ def build_graph(plain_llm=None, agent_llm=None, checkpointer=None):
     graph.add_node("confirm", confirm_node)
     graph.add_node("agent", agent_node)
     graph.add_node("tools", tool_node)
+    graph.add_node("verify", verify_node)
 
     graph.set_entry_point("interpret")
     graph.add_edge("interpret", "confirm")
@@ -129,6 +186,15 @@ def build_graph(plain_llm=None, agent_llm=None, checkpointer=None):
         "confirm", route_after_confirm,
         {"agent": "agent", "interpret": "interpret"},
     )
-    graph.add_conditional_edges("agent", tools_condition)
+    # tools_condition даёт "tools" (есть tool_call'ы) либо END (готов ответ).
+    # Ветку END подменяем на verify — самопроверку перед выдачей.
+    graph.add_conditional_edges(
+        "agent", tools_condition,
+        {"tools": "tools", END: "verify"},
+    )
     graph.add_edge("tools", "agent")
+    graph.add_conditional_edges(
+        "verify", route_after_verify,
+        {"agent": "agent", END: END},
+    )
     return graph.compile(checkpointer=checkpointer)
