@@ -1,84 +1,71 @@
 """
-reranker.py — cross-encoder reranker через sentence-transformers.
+reranker.py — cross-encoder reranking через Voyage AI (/rerank).
 
-Архитектурное отличие от первого этапа поиска (vector search):
+Второй этап поиска: на retrieve берём top-15-20 быстрым bi-encoder/BM25,
+затем reranker переранжирует только их. Voyage считает релевантность пары
+(query, document) на стороне API — модель видит query и document вместе,
+что точнее cosine по независимым векторам.
 
-  bi-encoder (что у нас в pgvector):
-      embed(query) → vec_q
-      embed(chunk) → vec_d           ← вектора независимы
-      score = cosine(vec_q, vec_d)
-      Быстро, можно заранее посчитать vec_d и индексировать.
+API Voyage:
+    POST {base}/rerank
+    {"model": "rerank-2.5", "query": "...", "documents": ["...", ...], "top_k": K}
+ответ: {"data": [{"index": 0, "relevance_score": 0.93}, ...], ...}
+        (index — позиция документа во входном списке; data отсортирован по
+         убыванию relevance_score)
 
-  cross-encoder (этот модуль):
-      model.predict([query, chunk]) → score
-      Модель видит query И chunk ВМЕСТЕ через cross-attention внутри
-      трансформера. Токены q и d сравниваются между собой напрямую.
-      Точнее, но нельзя заранее «закодировать» документ — каждая пара
-      проходит модель целиком.
-
-Поэтому reranker — это **второй этап**: на retrieve берём top-15-20 по
-быстрому bi-encoder/BM25, потом cross-encoder переранжирует только их.
-
-Модель: `BAAI/bge-reranker-v2-m3` — мультиязычная (русский поддерживается
-нативно), та же «семья» что у нашего embedding bge-m3. Архитектура XLM-RoBERTa
-+ pooling. На выходе один логит, мы применяем sigmoid → score в [0, 1].
-
-При первой инициализации модель ~570 МБ скачивается с HuggingFace Hub в
-~/.cache/huggingface/hub. На следующих запусках загружается из кэша мгновенно.
-
-Работа модели на macOS:
-  - На Apple Silicon (M1/M2/M3) sentence-transformers сам выбирает MPS
-    backend через PyTorch — это GPU-ускорение Apple. На паре десятков
-    чанков почти мгновенно.
-  - На Intel / без GPU — CPU. Тоже терпимо: один батч из 15 пар занимает
-    100-300 мс на современном CPU.
+Смена провайдера: реализовать класс под Protocol Reranker и вернуть его из
+make_reranker().
 """
 
 from __future__ import annotations
 
-import threading
 from dataclasses import replace
+from typing import Protocol, runtime_checkable
 
-from sentence_transformers import CrossEncoder
+import httpx
 
+from rag.config import settings
 from rag.vector_store import RetrievedChunk
 
 
-# Имя модели на HuggingFace Hub. Если хочется заменить — можно положить
-# в .env, но для учебного проекта хардкод проще.
-DEFAULT_MODEL = "BAAI/bge-reranker-v2-m3"
+@runtime_checkable
+class Reranker(Protocol):
+    """Контракт реранкера."""
+
+    def rerank(
+        self, query: str, chunks: list[RetrievedChunk], top_k: int | None = None
+    ) -> list[RetrievedChunk]: ...
 
 
-class CrossEncoderReranker:
+class VoyageReranker:
     """
-    Pointwise reranker на cross-encoder модели.
+    Pointwise reranker через Voyage /rerank.
 
-    Метод rerank принимает кандидатов от первого этапа поиска
-    (vector/text/hybrid) и переранжирует их через предсказание модели
-    на каждой паре (query, chunk).
+    client можно подменить (httpx.MockTransport) для тестов без сети.
     """
 
-    def __init__(self, model_name: str = DEFAULT_MODEL) -> None:
-        # CrossEncoder лениво загружает модель при первом вызове, но
-        # фактически конструктор уже скачивает/загружает в RAM. Это удобно:
-        # после __init__ модель готова, первый запрос не «прогревает».
-        #
-        # max_length=512 — стандартное окно для bge-reranker. Длинные пары
-        # модель сама обрежет (truncation). Наши чанки до 500 символов —
-        # помещаются с запасом.
-        #
-        # activation_fn=None оставляем дефолтным — модель сама применит
-        # sigmoid на финальном логите, получим score в [0, 1].
-        self._model = CrossEncoder(model_name, max_length=512)
-        self._model_name = model_name
-        # На случай если когда-нибудь будем вызывать из нескольких потоков
-        # одновременно — PyTorch внутри может быть не thread-safe.
-        # Сейчас один сервер, один запрос за раз — лок просто страховка.
-        self._lock = threading.Lock()
+    def __init__(
+        self,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        model: str | None = None,
+        timeout: float = 60.0,
+        client: httpx.Client | None = None,
+    ) -> None:
+        self._base_url = (base_url or settings.voyage_base_url).rstrip("/")
+        self._api_key = api_key or settings.voyage_api_key
+        self._model = model or settings.voyage_rerank_model
+        self._client = client or httpx.Client(
+            timeout=timeout,
+            headers={
+                "Authorization": f"Bearer {self._api_key}",
+                "Content-Type": "application/json",
+            },
+        )
 
     @property
     def model_name(self) -> str:
-        return self._model_name
+        return self._model
 
     def rerank(
         self,
@@ -87,42 +74,48 @@ class CrossEncoderReranker:
         top_k: int | None = None,
     ) -> list[RetrievedChunk]:
         """
-        Прогоняет все пары (query, chunk.content) через модель одним батчем,
-        записывает результат в reranker_score, сохраняет original_rank
-        (позицию ДО переранжирования), сортирует по убыванию score.
-
-        Один батч на все пары — это важная оптимизация: модель тогда
-        обрабатывает их параллельно через GPU/SIMD, а не один за другим.
+        Шлёт пары (query, chunk.content) в Voyage, проставляет reranker_score
+        и original_rank (позиция ДО переранжирования, 1-based), сортирует по
+        убыванию score. top_k (если задан) уходит в запрос — API вернёт только
+        top_k лучших.
         """
         if not chunks:
             return []
 
-        pairs = [(query, c.content) for c in chunks]
-        with self._lock:
-            # predict возвращает numpy.ndarray[float] длиной len(pairs).
-            # show_progress_bar=False — иначе sentence-transformers рисует
-            # tqdm-progressbar в stdout, нам это в логе сервера не нужно.
-            scores = self._model.predict(pairs, show_progress_bar=False)
+        documents = [c.content for c in chunks]
+        payload: dict = {
+            "model": self._model,
+            "query": query,
+            "documents": documents,
+        }
+        if top_k is not None:
+            payload["top_k"] = top_k
+
+        response = self._client.post(f"{self._base_url}/rerank", json=payload)
+        response.raise_for_status()
+        results = response.json()["data"]
 
         enriched = [
-            replace(c, reranker_score=float(s), original_rank=i)
-            for i, (c, s) in enumerate(zip(chunks, scores), start=1)
+            replace(
+                chunks[r["index"]],
+                reranker_score=float(r["relevance_score"]),
+                original_rank=r["index"] + 1,
+            )
+            for r in results
         ]
-        enriched.sort(
-            key=lambda c: (c.reranker_score or 0.0),
-            reverse=True,
-        )
-        if top_k is not None:
-            enriched = enriched[:top_k]
+        enriched.sort(key=lambda c: (c.reranker_score or 0.0), reverse=True)
         return enriched
 
-    # Lifecycle-методы — у sentence_transformers нет «явного close»,
-    # модель будет очищена сборщиком мусора при выгрузке процесса.
     def close(self) -> None:
-        pass
+        self._client.close()
 
-    def __enter__(self) -> "CrossEncoderReranker":
+    def __enter__(self) -> "VoyageReranker":
         return self
 
     def __exit__(self, *_exc_info: object) -> None:
         self.close()
+
+
+def make_reranker() -> Reranker:
+    """Единственная точка выбора провайдера реранкинга."""
+    return VoyageReranker()
