@@ -31,6 +31,7 @@ from typing import Iterable, Iterator
 import httpx
 
 from rag.config import settings
+from rag.pricing import enforce_price_caps_once
 from rag.vector_store import RetrievedChunk
 
 
@@ -103,6 +104,21 @@ def build_headers(
     return headers
 
 
+def build_routing_fields(model: str, settings) -> dict:
+    """
+    Доп. поля тела запроса OpenRouter:
+    - models: [primary, fallback] — нативный fallback (если задана запасная);
+    - provider.sort — выбор провайдера (price/throughput/latency), если задан.
+    Пустой dict, если ничего не настроено.
+    """
+    fields: dict = {}
+    if settings.llm_fallback_model:
+        fields["models"] = [model, settings.llm_fallback_model]
+    if settings.llm_provider_sort:
+        fields["provider"] = {"sort": settings.llm_provider_sort}
+    return fields
+
+
 class ChatGenerator:
     """
     Клиент к /chat/completions OpenAI-совместимого провайдера (OpenRouter
@@ -129,6 +145,7 @@ class ChatGenerator:
                 settings.llm_app_title,
             ),
         )
+        enforce_price_caps_once(settings)
 
     # --- обычный (нестриминговый) ответ ---
 
@@ -214,7 +231,7 @@ class ChatGenerator:
         temperature: float,
         stream: bool,
     ) -> dict:
-        return {
+        payload = {
             "model": self._model,
             "stream": stream,
             "temperature": temperature,
@@ -223,6 +240,8 @@ class ChatGenerator:
                 {"role": "user", "content": build_user_prompt(query, chunks)},
             ],
         }
+        payload.update(build_routing_fields(self._model, settings))
+        return payload
 
     def close(self) -> None:
         self._client.close()
