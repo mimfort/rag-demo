@@ -49,7 +49,7 @@ from rag.vector_store import ChunkInput
 
 from rag.config import settings
 from rag.embedder import LMStudioEmbedder
-from rag.generator import LMStudioGenerator, build_user_prompt
+from rag.generator import ChatGenerator, build_user_prompt
 from rag.decomposer import QueryDecomposer
 from rag.history import ChatHistoryStore, Message, make_standalone_query
 from rag.mmr import mmr_select
@@ -123,7 +123,7 @@ app.add_middleware(
 # Эти объекты заполнятся в startup-хендлере ниже.
 _embedder: LMStudioEmbedder | None = None
 _store: VectorStore | None = None
-_generator: LMStudioGenerator | None = None
+_generator: ChatGenerator | None = None
 _reranker: CrossEncoderReranker | None = None
 _decomposer: QueryDecomposer | None = None
 _rewriter: QueryRewriter | None = None
@@ -146,7 +146,7 @@ def _startup() -> None:
     global _history_store, _router
     _embedder = LMStudioEmbedder()
     _store = VectorStore()
-    _generator = LMStudioGenerator()
+    _generator = ChatGenerator()
     # Decomposer и Rewriter переиспользуют HTTP-клиент генератора (тот же
     # endpoint /chat/completions). Стартуют мгновенно.
     _decomposer = QueryDecomposer(_generator)
@@ -852,7 +852,7 @@ def _retrieve_with_explain(
     below = top_sim is not None and top_sim < min_similarity
 
     explain = ExplainOut(
-        embed_model=settings.embedding_model,
+        embed_model=settings.voyage_embedding_model,
         embed_dim=len(query_vec),
         embed_ms=round(embed_ms, 1),
         query_norm=q_norm,
@@ -1150,7 +1150,7 @@ def _empty_explain(**overrides) -> ExplainOut:
     """
     assert _embedder is not None
     return ExplainOut(
-        embed_model=settings.embedding_model,
+        embed_model=settings.voyage_embedding_model,
         embed_dim=settings.embedding_dim,
         embed_ms=0.0,
         query_norm=0.0,

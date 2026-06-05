@@ -32,7 +32,7 @@ from dataclasses import dataclass
 
 import psycopg
 
-from rag.generator import LMStudioGenerator
+from rag.generator import ChatGenerator
 
 
 @dataclass(frozen=True)
@@ -197,7 +197,7 @@ class StandaloneResult:
 
 
 def make_standalone_query(
-    generator: LMStudioGenerator,
+    generator: ChatGenerator,
     history: list[Message],
     current_query: str,
 ) -> StandaloneResult:

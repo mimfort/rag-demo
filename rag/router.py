@@ -33,7 +33,7 @@ import json
 import re
 from dataclasses import dataclass
 
-from rag.generator import LMStudioGenerator
+from rag.generator import ChatGenerator
 
 
 # Допустимые intent'ы. Если LLM вернёт что-то вне этого набора — fallback.
@@ -97,7 +97,7 @@ class QueryRouter:
     Использует тот же chat-endpoint что и основной генератор.
     """
 
-    def __init__(self, generator: LMStudioGenerator) -> None:
+    def __init__(self, generator: ChatGenerator) -> None:
         self._generator = generator
 
     def classify(

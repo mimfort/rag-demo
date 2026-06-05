@@ -31,7 +31,7 @@ import json
 import re
 from dataclasses import dataclass
 
-from rag.generator import LMStudioGenerator
+from rag.generator import ChatGenerator
 
 
 @dataclass(frozen=True)
@@ -93,7 +93,7 @@ class QueryDecomposer:
     лишних HTTP-клиентов.
     """
 
-    def __init__(self, generator: LMStudioGenerator) -> None:
+    def __init__(self, generator: ChatGenerator) -> None:
         self._generator = generator
 
     def decompose(self, query: str) -> DecomposeResult:
