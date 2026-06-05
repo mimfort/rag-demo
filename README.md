@@ -1,4 +1,4 @@
-# RAG demo: LM Studio + PostgreSQL/pgvector
+# RAG demo: OpenRouter + Voyage AI + PostgreSQL/pgvector
 
 Учебный проект для понимания **как работает RAG изнутри**: как создаются
 эмбеддинги, как ищется контекст, как собирается финальный промпт для LLM.
@@ -33,7 +33,7 @@ Pipeline:
 ```
 rag-demo/
 ├── docker-compose.yml         # Postgres + pgvector
-├── .env.example               # настройки (URL LM Studio, токен, DSN БД)
+├── .env.example               # настройки (OpenRouter, Voyage AI, БД)
 ├── requirements.txt           # httpx, psycopg, pgvector, numpy, dotenv
 ├── docs/                      # корпус документов (.md)
 │   ├── python_basics.md
@@ -44,10 +44,10 @@ rag-demo/
 ├── rag/
 │   ├── config.py              # настройки из .env
 │   ├── chunker.py             # текст → чанки
-│   ├── embedder.py            # HTTP к LM Studio /v1/embeddings
+│   ├── embedder.py            # HTTP к Voyage AI /v1/embed
 │   ├── vector_store.py        # psycopg + pgvector: INSERT / SELECT
 │   ├── retriever.py           # склейка: embed(query) → search(top_k)
-│   └── generator.py           # HTTP к LM Studio /v1/chat/completions (+stream)
+│   └── generator.py           # HTTP к OpenRouter /v1/chat/completions (+stream)
 ├── web/                       # веб-интерфейс
 │   ├── server.py              # FastAPI: /api/ask, /api/ask/stream (SSE)
 │   └── static/
@@ -71,12 +71,8 @@ docker compose up -d --build
 
 Требования:
 - `.env` рядом (скопируй `.env.example`).
-- LM Studio запущена **на хосте** на :1234 — контейнер ходит туда через
-  `host.docker.internal` (на Linux это разрешено через `extra_hosts:
-  host-gateway` в compose). Внутрикомпозный `DB_HOST` уже переопределён
-  на `postgres` — менять `.env` не нужно.
-- Reranker-модель (~570 МБ) скачается при первом обращении в volume
-  `hf_cache` — дальше старт мгновенный.
+- Ключи API: `LLM_API_KEY` (OpenRouter) и `VOYAGE_API_KEY` (Voyage AI) в `.env`.
+- Внутрикомпозный `DB_HOST` уже переопределён на `postgres` — менять `.env` не нужно.
 
 Проиндексировать корпус **внутри** контейнера:
 ```bash
@@ -110,15 +106,17 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-# открой .env и проверь URL LM Studio, токен и имя chat-модели
+# открой .env и поправь:
+#   - LLM_API_KEY (OpenRouter ключ)
+#   - LLM_MODEL (например anthropic/claude-3.5-sonnet)
+#   - VOYAGE_API_KEY (Voyage AI ключ)
 ```
 
-Чтобы узнать точные имена моделей, как их видит LM Studio:
-
-```bash
-curl -H "Authorization: Bearer $LM_STUDIO_API_KEY" \
-     http://192.168.2.129:1234/v1/models | jq
-```
+> **Смена embedding-провайдера требует переиндексации.** Векторы разных
+> моделей несовместимы. После перехода на Voyage (`voyage-4-large`) очисти
+> таблицу чанков и прогони `python ingest.py` заново. Параметры провайдеров
+> задаются в `.env`: `LLM_*` (chat через OpenRouter), `VOYAGE_*` (embeddings
+> и rerank).
 
 ### 3. Проиндексировать документы
 
@@ -127,7 +125,7 @@ python ingest.py
 ```
 
 Скрипт пройдёт по `docs/`, нарежет каждый файл на чанки, посчитает
-эмбеддинги через LM Studio (bge-m3) и положит всё в Postgres.
+эмбеддинги через Voyage AI (`voyage-4-large`) и положит всё в Postgres.
 
 ### 4. Спросить
 
@@ -265,11 +263,10 @@ LIMIT 5;
 - Заменить системный промпт в `rag/generator.py` и посмотреть, как
   меняется стиль ответов.
 - Попробовать L2-индекс вместо cosine: пересоздать индекс с
-  `vector_l2_ops` и в SQL поменять `<=>` на `<->`. На bge-m3 разница
+  `vector_l2_ops` и в SQL поменять `<=>` на `<->`. На Voyage API разница
   маленькая (векторы нормализованы), но методически полезно увидеть.
-- Реализовать **reranker**: достать top-20 по cosine, потом
-  переупорядочить cross-encoder моделью (например, bge-reranker-v2-m3
-  через LM Studio) и взять top-5.
+- Реализовать дополнительный **reranker**: достать top-20 по cosine, потом
+  переупорядочить через Voyage (`rerank-2.5`) и взять top-5.
 - Полнотекстовый поиск **в дополнение** к векторному (hybrid search):
   Postgres умеет это через `tsvector`. Объединить два рейтинга — даёт
   ощутимый прирост качества.
@@ -283,6 +280,6 @@ LIMIT 5;
   Пространства разных моделей несовместимы — иначе поиск выдаст шум.
 - **Чанки слишком длинные** → размытый эмбеддинг, плохой поиск.
   **Слишком короткие** → теряется контекст внутри одного чанка.
-  Для bge-m3 на русском 400–700 символов обычно работает хорошо.
+  Для Voyage (`voyage-4-large`) на русском 400–700 символов обычно работает хорошо.
 - **LLM может «галлюцинировать»** даже при хорошем контексте.
   Защита — явные инструкции в system prompt и низкая `temperature`.
