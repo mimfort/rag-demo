@@ -93,16 +93,31 @@ class VoyageReranker:
 
         response = self._client.post(f"{self._base_url}/rerank", json=payload)
         response.raise_for_status()
-        results = response.json()["data"]
-
-        enriched = [
-            replace(
-                chunks[r["index"]],
-                reranker_score=float(r["relevance_score"]),
-                original_rank=r["index"] + 1,
+        body = response.json()
+        if "data" not in body:
+            raise RuntimeError(
+                f"Ответ Voyage /rerank без поля 'data': ключи {list(body)}. "
+                f"Похоже, формат API изменился."
             )
-            for r in results
-        ]
+        results = body["data"]
+
+        enriched = []
+        for r in results:
+            try:
+                idx = r["index"]
+                score = float(r["relevance_score"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Некорректный элемент ответа Voyage /rerank: {r!r} ({exc})."
+                ) from exc
+            if not 0 <= idx < len(chunks):
+                raise RuntimeError(
+                    f"Voyage /rerank вернул index={idx}, а на входе было "
+                    f"{len(chunks)} документов — ответ не соответствует запросу."
+                )
+            enriched.append(
+                replace(chunks[idx], reranker_score=score, original_rank=idx + 1)
+            )
         enriched.sort(key=lambda c: (c.reranker_score or 0.0), reverse=True)
         return enriched
 

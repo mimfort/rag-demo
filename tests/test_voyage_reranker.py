@@ -1,4 +1,5 @@
 import httpx
+import pytest
 
 from rag.reranker import VoyageReranker, make_reranker, Reranker
 from rag.vector_store import RetrievedChunk
@@ -64,3 +65,24 @@ def test_make_reranker_returns_protocol(monkeypatch):
                                        "voyage_api_key": "pa",
                                        "voyage_rerank_model": "rerank-2.5"})())
     assert isinstance(make_reranker(), Reranker)
+
+
+def test_rerank_index_out_of_range_raises():
+    def handler(request: httpx.Request) -> httpx.Response:
+        # index 5, а на входе только 1 документ → ответ некорректен.
+        return httpx.Response(200, json={"data": [
+            {"index": 5, "relevance_score": 0.9},
+        ]})
+
+    rr = VoyageReranker(api_key="pa", client=_client(handler))
+    with pytest.raises(RuntimeError):
+        rr.rerank("q", [_chunk("only")])
+
+
+def test_rerank_missing_data_field_raises():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"object": "list"})  # нет "data"
+
+    rr = VoyageReranker(api_key="pa", client=_client(handler))
+    with pytest.raises(RuntimeError):
+        rr.rerank("q", [_chunk("x")])
