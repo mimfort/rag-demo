@@ -1,6 +1,8 @@
 "use client";
 
 import * as React from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Send, StopCircle, Bot, User, Sparkles } from "lucide-react";
 import { toast } from "sonner";
@@ -258,7 +260,16 @@ function Bubble({
           "rounded-2xl px-4 py-3",
           role === "user" ? "bg-primary/10 border border-primary/30" : "bg-card border border-border",
         )}>
-          <p className="prose-rag whitespace-pre-wrap">{content}</p>
+          {role === "user" ? (
+            // Запрос пользователя — как есть (markdown не рендерим).
+            <p className="prose-rag whitespace-pre-wrap">{content}</p>
+          ) : (
+            // Ответ агента приходит в markdown (жирный, списки, заголовки) —
+            // рендерим так же, как в RAG-чате, чтобы оформление было читаемым.
+            <div className="prose-rag">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+            </div>
+          )}
           {streaming && <span className="ml-1 inline-block w-[6px] h-[1em] bg-primary animate-pulse align-middle" />}
           {role === "assistant" && trace && trace.length > 0 && (
             <div className="mt-2 border-t border-border pt-2">
