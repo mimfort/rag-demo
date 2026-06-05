@@ -62,7 +62,9 @@ export function AgentChat() {
             closeClean(); // граф на паузе; продолжим через resume
             return;
           }
-          if (type === "final_answer" && typeof data.text === "string") {
+          // Только непустой финальный ответ обновляет answer: пустой rewrite
+          // на verify-доработке не должен затирать уже показанный ответ.
+          if (type === "final_answer" && typeof data.text === "string" && data.text.trim()) {
             setAnswer(data.text);
           }
           if (type === "done" || type === "error") {

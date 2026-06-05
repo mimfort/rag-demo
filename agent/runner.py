@@ -129,7 +129,13 @@ async def _astream_events(
                                     "id": tc["id"],
                                 })
                         else:
-                            yield _event("final_answer", {"text": msg.content or ""})
+                            # Пустой AIMessage — НЕ финальный ответ. На verify-
+                            # доработке модель иногда возвращает пустой content;
+                            # без этой проверки пустой ответ перезатёр бы
+                            # предыдущий нормальный и в UI/БД ушла бы пустота.
+                            text = msg.content if isinstance(msg.content, str) else ""
+                            if text.strip():
+                                yield _event("final_answer", {"text": text})
                     elif isinstance(msg, ToolMessage):
                         result: object = msg.content
                         try:
