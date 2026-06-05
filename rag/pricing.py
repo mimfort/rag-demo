@@ -41,6 +41,9 @@ def _to_mtok(raw: object) -> float:
     try:
         return float(raw or 0.0) * 1_000_000
     except (TypeError, ValueError):
+        # Битая цена трактуется как 0.0 (fail-open), но это стоит увидеть —
+        # возможно, изменился формат ответа API.
+        print(f"⚠ Не удалось разобрать цену {raw!r}; считаю $0.0/1М.")
         return 0.0
 
 

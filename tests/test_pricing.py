@@ -107,7 +107,7 @@ def test_enforce_fail_open_on_fetch_error(capsys):
         return httpx.Response(500, json={"error": "boom"})
     s = _settings(llm_max_prompt_price=3.0)
     enforce_price_caps_once(s, client=_client(handler))  # не падает
-    assert "цен" in capsys.readouterr().out.lower() or True
+    assert "не удалось получить цены" in capsys.readouterr().out.lower()
 
 
 def test_enforce_is_idempotent():
