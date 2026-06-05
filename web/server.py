@@ -274,7 +274,7 @@ class ExplainOut(BaseModel):
     """
     # ── про эмбеддинг запроса ─────────────────────────────────────────
     embed_model: str
-    embed_dim: int            # размерность вектора (для bge-m3 = 1024)
+    embed_dim: int            # размерность вектора (для voyage-4-large = 1024)
     embed_ms: float           # сколько мс заняла эмбеддинг-операция
     query_norm: float         # ||q|| — длина вектора запроса
     query_preview: list[float]  # первые ~32 значения для визуализации
