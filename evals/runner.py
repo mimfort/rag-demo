@@ -36,7 +36,7 @@ from typing import Callable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from rag.embedder import Embedder, make_embedder
-from rag.reranker import CrossEncoderReranker
+from rag.reranker import Reranker, make_reranker
 from rag.vector_store import VectorStore
 from evals.metrics import (
     AggregateMetrics,
@@ -118,7 +118,7 @@ def make_hybrid_retriever(
 def make_hybrid_rerank_retriever(
     embedder: Embedder,
     store: VectorStore,
-    reranker: CrossEncoderReranker,
+    reranker: Reranker,
     k: int,
     candidate_n: int = 15,
 ) -> Retriever:
@@ -225,10 +225,10 @@ def main() -> int:
             rows.append((name, agg))
             all_details[name] = det
 
-        # Медленный конфиг отдельно — модель ~570МБ.
+        # Конфиг с reranking — отдельный сетевой вызов к Voyage.
         if not args.skip_rerank:
-            print("→ загружаю cross-encoder (bge-reranker-v2-m3)…")
-            with CrossEncoderReranker() as reranker:
+            print("→ инициализирую Voyage reranker…")
+            with make_reranker() as reranker:
                 retr = make_hybrid_rerank_retriever(
                     embedder, store, reranker, args.top_k,
                 )

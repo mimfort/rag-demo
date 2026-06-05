@@ -53,7 +53,7 @@ from rag.generator import ChatGenerator, build_user_prompt
 from rag.decomposer import QueryDecomposer
 from rag.history import ChatHistoryStore, Message, make_standalone_query
 from rag.mmr import mmr_select
-from rag.reranker import CrossEncoderReranker
+from rag.reranker import Reranker, make_reranker
 from rag.rewriter import QueryRewriter
 from rag.router import QueryRouter, RouteDecision
 from rag.vector_store import RetrievedChunk, ScoredChunk, VectorStore, RRF_K
@@ -124,7 +124,7 @@ app.add_middleware(
 _embedder: Embedder | None = None
 _store: VectorStore | None = None
 _generator: ChatGenerator | None = None
-_reranker: CrossEncoderReranker | None = None
+_reranker: Reranker | None = None
 _decomposer: QueryDecomposer | None = None
 _rewriter: QueryRewriter | None = None
 _history_store: ChatHistoryStore | None = None
@@ -136,11 +136,9 @@ def _startup() -> None:
     """
     Открываем долгоживущие соединения при старте процесса.
 
-    Reranker — отдельный кусок: при первой инициализации он скачает
-    модель ~570 МБ с HuggingFace Hub. Дальше — мгновенный старт из кэша.
-    Чтобы не блокировать запуск, если модель ещё не скачана — инициализация
-    в try/except: если что-то пошло не так, сервер всё равно стартует,
-    просто rerank-параметр будет отдавать 503.
+    Reranker теперь сетевой (Voyage /rerank) — инициализация мгновенна;
+    try/except оставляем на случай недоступности сети или отсутствия ключа:
+    тогда rerank-параметр отдаёт 503.
     """
     global _embedder, _store, _generator, _reranker, _decomposer, _rewriter
     global _history_store, _router
@@ -156,7 +154,7 @@ def _startup() -> None:
     # Router — тот же HTTP-клиент chat-модели, классифицирует запросы.
     _router = QueryRouter(_generator)
     try:
-        _reranker = CrossEncoderReranker()
+        _reranker = make_reranker()
     except Exception as exc:
         # Не критично для остального API — просто rerank будет недоступен.
         print(f"⚠ Reranker не инициализирован: {exc}")
@@ -428,7 +426,7 @@ def _multi_query_per_subq_rerank(
             key = (c.source, c.chunk_index)
             existing = best_by_key.get(key)
             # Keep the best score across subqueries. reranker_score
-            # сопоставим между подзапросами (sigmoid у нашего bge-reranker).
+            # сопоставим между подзапросами (нормированный score reranker'а).
             if existing is None or (
                 (c.reranker_score or 0.0) > (existing.reranker_score or 0.0)
             ):
@@ -1098,10 +1096,10 @@ def _save_chat_messages(
     )
 
 
-# Порог уверенности reranker'а (sigmoid 0..1): ниже него считаем, что
-# модель НЕ нашла релевантного контекста и в Auto-режиме переключаемся
-# на общую LLM. Эмпирически на bge-reranker-v2-m3: релевантные чанки
-# дают 0.5-0.95, нерелевантные — почти 0. Запас выбран небольшой.
+# Порог уверенности reranker'а (нормированный score 0..1): ниже него
+# считаем, что модель НЕ нашла релевантного контекста и в Auto-режиме
+# переключаемся на общую LLM. Эмпирически релевантные чанки дают
+# 0.5-0.95, нерелевантные — почти 0. Запас выбран небольшой.
 AUTO_FALLBACK_RERANK_THRESHOLD = 0.1
 
 
