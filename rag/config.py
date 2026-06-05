@@ -41,6 +41,14 @@ def _env_int(name: str, default: int) -> int:
     return int(raw) if raw is not None else default
 
 
+def _env_float_optional(name: str) -> float | None:
+    """Опциональное float-значение: пусто/не задано → None."""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return None
+    return float(raw)
+
+
 @dataclass(frozen=True)
 class Settings:
     """
@@ -55,6 +63,13 @@ class Settings:
     # Опциональные заголовки атрибуции OpenRouter (пустая строка = не слать).
     llm_http_referer: str
     llm_app_title: str
+    # Запасная модель (нативный OpenRouter fallback). Пусто = нет fallback.
+    llm_fallback_model: str
+    # Ценовой потолок, USD за 1М токенов. None = без ограничения.
+    llm_max_prompt_price: float | None
+    llm_max_completion_price: float | None
+    # Маршрутизация провайдера OpenRouter: "", "price", "throughput", "latency".
+    llm_provider_sort: str
 
     # --- Voyage AI (embeddings + rerank) ---
     voyage_api_key: str
@@ -95,12 +110,16 @@ def load_settings() -> Settings:
     Создаёт Settings, читая значения из окружения.
     Вызывается один раз при импорте модуля — см. ниже.
     """
-    return Settings(
+    settings_obj = Settings(
         llm_base_url=_env("LLM_BASE_URL", "https://openrouter.ai/api/v1"),
         llm_api_key=_env("LLM_API_KEY"),
         llm_model=_env("LLM_MODEL"),
         llm_http_referer=os.getenv("LLM_HTTP_REFERER", ""),
         llm_app_title=os.getenv("LLM_APP_TITLE", ""),
+        llm_fallback_model=os.getenv("LLM_FALLBACK_MODEL", ""),
+        llm_max_prompt_price=_env_float_optional("LLM_MAX_PROMPT_PRICE_PER_MTOK"),
+        llm_max_completion_price=_env_float_optional("LLM_MAX_COMPLETION_PRICE_PER_MTOK"),
+        llm_provider_sort=os.getenv("LLM_PROVIDER_SORT", ""),
         voyage_api_key=_env("VOYAGE_API_KEY"),
         voyage_base_url=_env("VOYAGE_BASE_URL", "https://api.voyageai.com/v1"),
         voyage_embedding_model=_env("VOYAGE_EMBEDDING_MODEL", "voyage-4-large"),
@@ -115,6 +134,14 @@ def load_settings() -> Settings:
         chunk_overlap=_env_int("CHUNK_OVERLAP", 80),
         top_k=_env_int("TOP_K", 5),
     )
+
+    allowed_sort = {"", "price", "throughput", "latency"}
+    if settings_obj.llm_provider_sort not in allowed_sort:
+        raise RuntimeError(
+            f"LLM_PROVIDER_SORT='{settings_obj.llm_provider_sort}' недопустимо. "
+            f"Разрешено: price, throughput, latency (или пусто)."
+        )
+    return settings_obj
 
 
 # Глобальный объект настроек. Импортируется во всех модулях как
