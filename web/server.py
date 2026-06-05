@@ -2099,7 +2099,9 @@ async def _agent_turn_events(thread_id: str, *, query, resume):
     final_answer = ""
     async for event in run_stream(thread_id, query=query, resume=resume):
         buf.append(event)
-        if event["type"] == "final_answer":
+        if event["type"] == "final_answer" and event["data"]["text"].strip():
+            # Только непустой финальный ответ обновляет сохраняемый текст —
+            # пустой rewrite на verify-доработке не должен затирать хороший.
             final_answer = event["data"]["text"]
         if event["type"] in ("done", "error"):
             await _save_agent_message_async("assistant", final_answer, list(buf))
