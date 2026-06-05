@@ -1,6 +1,6 @@
 """
-Фабрика LLM. ChatOpenAI работает с LM Studio: тот OpenAI-совместим,
-просто base_url другой.
+Фабрика LLM. ChatOpenAI работает с любым OpenAI-совместимым провайдером
+(по умолчанию OpenRouter): отличается только base_url/ключ/модель в .env.
 """
 
 from __future__ import annotations
@@ -12,16 +12,17 @@ from rag.config import settings as rag_settings
 
 def make_llm() -> ChatOpenAI:
     """
-    Возвращает ChatOpenAI настроенную на локальную LM Studio.
+    Возвращает ChatOpenAI, настроенную на chat-провайдера из .env
+    (LLM_BASE_URL / LLM_API_KEY / LLM_MODEL).
 
-    temperature=0.2 — мы хотим стабильный tool-calling, не креатив.
-    max_retries=1 — обычно LM Studio либо отвечает, либо нет; retry не
-    спасёт.
+    temperature=0.2 — нам нужен стабильный tool-calling, не креатив.
+    max_retries=1 — короткий retry; при недоступности провайдера лучше
+    упасть явно, чем долго ретраить.
     """
     return ChatOpenAI(
-        model=rag_settings.chat_model,
-        base_url=rag_settings.lm_studio_base_url,
-        api_key=rag_settings.lm_studio_api_key,
+        model=rag_settings.llm_model,
+        base_url=rag_settings.llm_base_url,
+        api_key=rag_settings.llm_api_key,
         temperature=0.2,
         max_retries=1,
     )

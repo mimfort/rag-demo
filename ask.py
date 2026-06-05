@@ -23,8 +23,8 @@ import argparse
 import sys
 
 from rag.config import settings
-from rag.embedder import LMStudioEmbedder
-from rag.generator import LMStudioGenerator, build_user_prompt
+from rag.embedder import make_embedder
+from rag.generator import ChatGenerator, build_user_prompt
 from rag.retriever import Retriever
 from rag.vector_store import RetrievedChunk, VectorStore
 
@@ -48,21 +48,21 @@ def print_retrieved_chunks(chunks: list[RetrievedChunk]) -> None:
 def run(query: str, top_k: int, stream: bool, verbose: bool) -> int:
     # Открываем все три ресурса разом: эмбеддер, хранилище, генератор.
     with (
-        LMStudioEmbedder() as embedder,
+        make_embedder() as embedder,
         VectorStore() as store,
-        LMStudioGenerator() as generator,
+        ChatGenerator() as generator,
     ):
         retriever = Retriever(embedder, store)
 
         if verbose:
-            print(f"\n[1/3] Эмбеддим вопрос моделью {settings.embedding_model}…")
+            print(f"\n[1/3] Эмбеддим вопрос моделью {settings.voyage_embedding_model}…")
 
         chunks = retriever.retrieve(query, top_k=top_k)
 
         if verbose:
             print(f"\n[2/3] Найдено чанков (top-{top_k}):")
             print_retrieved_chunks(chunks)
-            print(f"\n[3/3] Формируем промпт и отправляем в {settings.chat_model}…")
+            print(f"\n[3/3] Формируем промпт и отправляем в {settings.llm_model}…")
             print("─" * 70)
             print("ПРОМПТ (user-сообщение):")
             print("─" * 70)

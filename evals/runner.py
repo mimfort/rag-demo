@@ -35,8 +35,8 @@ from typing import Callable
 # Чтобы можно было запускать `python -m evals.runner` из корня проекта.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from rag.embedder import LMStudioEmbedder
-from rag.reranker import CrossEncoderReranker
+from rag.embedder import Embedder, make_embedder
+from rag.reranker import Reranker, make_reranker
 from rag.vector_store import VectorStore
 from evals.metrics import (
     AggregateMetrics,
@@ -85,12 +85,12 @@ Retriever = Callable[[str], list[ChunkKey]]
 
 
 def make_vector_retriever(
-    embedder: LMStudioEmbedder,
+    embedder: Embedder,
     store: VectorStore,
     k: int,
 ) -> Retriever:
     def run(query: str) -> list[ChunkKey]:
-        vec = embedder.embed_one(query)
+        vec = embedder.embed_query(query)
         hits = store.search(vec, top_k=k)
         return [(h.source, h.chunk_index) for h in hits]
     return run
@@ -104,26 +104,26 @@ def make_text_retriever(store: VectorStore, k: int) -> Retriever:
 
 
 def make_hybrid_retriever(
-    embedder: LMStudioEmbedder,
+    embedder: Embedder,
     store: VectorStore,
     k: int,
 ) -> Retriever:
     def run(query: str) -> list[ChunkKey]:
-        vec = embedder.embed_one(query)
+        vec = embedder.embed_query(query)
         hits = store.hybrid_search(query, vec, top_k=k, candidate_n=20)
         return [(h.source, h.chunk_index) for h in hits]
     return run
 
 
 def make_hybrid_rerank_retriever(
-    embedder: LMStudioEmbedder,
+    embedder: Embedder,
     store: VectorStore,
-    reranker: CrossEncoderReranker,
+    reranker: Reranker,
     k: int,
     candidate_n: int = 15,
 ) -> Retriever:
     def run(query: str) -> list[ChunkKey]:
-        vec = embedder.embed_one(query)
+        vec = embedder.embed_query(query)
         # candidate_n берём НАМНОГО больше k — это смысл reranking.
         cand = store.hybrid_search(query, vec, top_k=candidate_n, candidate_n=20)
         reranked = reranker.rerank(query, cand, top_k=k)
@@ -210,7 +210,7 @@ def main() -> int:
     print(f"Голден-сет: {len(items)} вопросов из {GOLDEN_SET_PATH.name}")
     print(f"top_k = {args.top_k}\n")
 
-    with LMStudioEmbedder() as embedder, VectorStore() as store:
+    with make_embedder() as embedder, VectorStore() as store:
         rows: list[tuple[str, AggregateMetrics]] = []
         # all_details[config_name] = list[(item, query_metrics)]
         all_details: dict[str, list[tuple[GoldenItem, QueryMetrics]]] = {}
@@ -225,10 +225,10 @@ def main() -> int:
             rows.append((name, agg))
             all_details[name] = det
 
-        # Медленный конфиг отдельно — модель ~570МБ.
+        # Конфиг с reranking — отдельный сетевой вызов к Voyage.
         if not args.skip_rerank:
-            print("→ загружаю cross-encoder (bge-reranker-v2-m3)…")
-            with CrossEncoderReranker() as reranker:
+            print("→ инициализирую Voyage reranker…")
+            with make_reranker() as reranker:
                 retr = make_hybrid_rerank_retriever(
                     embedder, store, reranker, args.top_k,
                 )

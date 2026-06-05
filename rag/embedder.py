@@ -1,54 +1,50 @@
 """
-embedder.py — превращает текст в вектор через LM Studio.
+embedder.py — превращает текст в вектор через Voyage AI.
 
-Что такое «эмбеддинг»?
-Эмбеддинг — это вектор фиксированной длины (у bge-m3 — 1024 числа float),
-который кодирует «смысл» текста. Модель обучена так, что близкие по смыслу
-тексты получают близкие векторы (по cosine similarity), а несвязанные —
-далёкие. Именно это позволяет искать «по смыслу», а не по совпадению слов.
+Эмбеддинг — вектор фиксированной длины (voyage-4-large по умолчанию 1024
+числа float), кодирующий «смысл» текста: близкие по смыслу тексты получают
+близкие векторы (cosine), что позволяет искать «по смыслу».
 
-API LM Studio совместимо с OpenAI. Запрос на эмбеддинги выглядит так:
+Voyage-специфика: параметр input_type. Для ретрива качество выше, если при
+индексации слать input_type="document", а на поиске — input_type="query"
+(модель подмешивает разные служебные префиксы). Поэтому интерфейс разделён
+на embed_documents и embed_query.
 
-    POST {base_url}/embeddings
-    Authorization: Bearer {api_key}
-    Content-Type: application/json
+API Voyage:
+    POST {base}/embeddings
+    {"model": "...", "input": ["...", ...], "input_type": "document"|"query"}
+ответ: {"data": [{"index": 0, "embedding": [...]}, ...], ...}
 
-    {
-      "model": "text-embedding-bge-m3",
-      "input": ["текст 1", "текст 2", ...]
-    }
-
-Ответ:
-
-    {
-      "data": [
-        {"embedding": [0.0123, -0.045, ...], "index": 0, "object": "embedding"},
-        {"embedding": [...],                  "index": 1, "object": "embedding"}
-      ],
-      "model": "text-embedding-bge-m3",
-      "object": "list",
-      "usage": {...}
-    }
-
-Здесь мы намеренно НЕ используем библиотеку `openai` — хочется чтобы было
-видно сырое HTTP-взаимодействие. В реальном проекте можно взять и SDK.
+Смена провайдера: реализовать класс под Protocol Embedder и вернуть его из
+make_embedder() — остальной код зависит только от интерфейса.
 """
 
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Iterable, Protocol, runtime_checkable
 
 import httpx
 
 from rag.config import settings
 
 
-class LMStudioEmbedder:
+@runtime_checkable
+class Embedder(Protocol):
+    """Контракт эмбеддера. Реализации не обязаны наследоваться явно."""
+
+    def embed_query(self, text: str) -> list[float]: ...
+
+    def embed_documents(self, texts: Iterable[str]) -> list[list[float]]: ...
+
+    def close(self) -> None: ...
+
+
+class VoyageEmbedder:
     """
-    Клиент к /v1/embeddings LM Studio.
-    Поддерживает батч (несколько текстов за один запрос) — это быстрее,
-    чем по одному, потому что модель умеет считать их параллельно на GPU
-    и нет накладных расходов на HTTP per call.
+    Клиент к /embeddings Voyage. Батч (несколько текстов за запрос, ≤ 1000)
+    быстрее поштучной отправки: нет накладных расходов на HTTP per call.
+
+    client можно подменить (httpx.MockTransport) для тестов без сети.
     """
 
     def __init__(
@@ -56,16 +52,15 @@ class LMStudioEmbedder:
         base_url: str | None = None,
         api_key: str | None = None,
         model: str | None = None,
+        dim: int | None = None,
         timeout: float = 60.0,
+        client: httpx.Client | None = None,
     ) -> None:
-        # Если конкретный параметр не передан — берём из глобальных настроек.
-        # Такой паттерн удобен для тестирования: в тестах можно подсунуть моки.
-        self._base_url = (base_url or settings.lm_studio_base_url).rstrip("/")
-        self._api_key = api_key or settings.lm_studio_api_key
-        self._model = model or settings.embedding_model
-        # Создаём httpx-клиент один раз: внутри он держит keep-alive
-        # connection pool, что заметно ускоряет серию запросов.
-        self._client = httpx.Client(
+        self._base_url = (base_url or settings.voyage_base_url).rstrip("/")
+        self._api_key = api_key or settings.voyage_api_key
+        self._model = model or settings.voyage_embedding_model
+        self._dim = dim if dim is not None else settings.embedding_dim
+        self._client = client or httpx.Client(
             timeout=timeout,
             headers={
                 "Authorization": f"Bearer {self._api_key}",
@@ -73,61 +68,47 @@ class LMStudioEmbedder:
             },
         )
 
-    # --- удобные методы ---
+    def embed_query(self, text: str) -> list[float]:
+        return self._embed([text], "query")[0]
 
-    def embed_one(self, text: str) -> list[float]:
-        """Эмбеддинг одного текста — обёртка над embed_many для удобства."""
-        vectors = self.embed_many([text])
-        return vectors[0]
-
-    def embed_many(self, texts: Iterable[str]) -> list[list[float]]:
-        """
-        Эмбеддинги для пачки текстов.
-        Принимаем любую итерируемую коллекцию, но материализуем в list:
-        нам нужно знать длину и иметь возможность сериализовать в JSON.
-        """
+    def embed_documents(self, texts: Iterable[str]) -> list[list[float]]:
         texts_list = list(texts)
         if not texts_list:
             return []
+        return self._embed(texts_list, "document")
 
-        # Формируем тело запроса в формате OpenAI Embeddings API.
+    def _embed(self, texts: list[str], input_type: str) -> list[list[float]]:
         payload = {
             "model": self._model,
-            "input": texts_list,
+            "input": texts,
+            "input_type": input_type,
         }
-
-        url = f"{self._base_url}/embeddings"
-        response = self._client.post(url, json=payload)
-        # raise_for_status() выкидывает исключение при 4xx/5xx —
-        # пусть лучше упадём громко, чем будем работать с битыми данными.
+        response = self._client.post(f"{self._base_url}/embeddings", json=payload)
         response.raise_for_status()
         data = response.json()
 
-        # API не гарантирует порядок элементов в data, поэтому сортируем по index
-        # (на всякий случай — в практике LM Studio возвращает по порядку).
         items = sorted(data["data"], key=lambda item: item["index"])
         vectors = [item["embedding"] for item in items]
 
-        # Лёгкая проверка размерности — если модель внезапно отдала векторы
-        # другой длины, чем мы ожидаем в схеме БД, лучше упасть сейчас,
-        # а не получить ошибку pgvector при INSERT.
         for i, vec in enumerate(vectors):
-            if len(vec) != settings.embedding_dim:
+            if len(vec) != self._dim:
                 raise RuntimeError(
                     f"Эмбеддинг {i} имеет размерность {len(vec)}, "
-                    f"а ожидается {settings.embedding_dim}. "
-                    f"Проверь EMBEDDING_DIM в .env и модель в LM Studio."
+                    f"а ожидается {self._dim}. Проверь EMBEDDING_DIM в .env "
+                    f"и VOYAGE_EMBEDDING_MODEL."
                 )
-
         return vectors
 
     def close(self) -> None:
-        """Закрывает HTTP-клиент. Вызывать в конце работы."""
         self._client.close()
 
-    # Поддержка `with LMStudioEmbedder() as emb:` — гарантированно закроет клиент.
-    def __enter__(self) -> "LMStudioEmbedder":
+    def __enter__(self) -> "VoyageEmbedder":
         return self
 
     def __exit__(self, *_exc_info: object) -> None:
         self.close()
+
+
+def make_embedder() -> Embedder:
+    """Единственная точка выбора провайдера эмбеддингов."""
+    return VoyageEmbedder()

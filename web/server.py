@@ -48,12 +48,12 @@ from rag.loaders import (
 from rag.vector_store import ChunkInput
 
 from rag.config import settings
-from rag.embedder import LMStudioEmbedder
-from rag.generator import LMStudioGenerator, build_user_prompt
+from rag.embedder import Embedder, make_embedder
+from rag.generator import ChatGenerator, build_user_prompt
 from rag.decomposer import QueryDecomposer
 from rag.history import ChatHistoryStore, Message, make_standalone_query
 from rag.mmr import mmr_select
-from rag.reranker import CrossEncoderReranker
+from rag.reranker import Reranker, make_reranker
 from rag.rewriter import QueryRewriter
 from rag.router import QueryRouter, RouteDecision
 from rag.vector_store import RetrievedChunk, ScoredChunk, VectorStore, RRF_K
@@ -121,10 +121,10 @@ app.add_middleware(
 )
 
 # Эти объекты заполнятся в startup-хендлере ниже.
-_embedder: LMStudioEmbedder | None = None
+_embedder: Embedder | None = None
 _store: VectorStore | None = None
-_generator: LMStudioGenerator | None = None
-_reranker: CrossEncoderReranker | None = None
+_generator: ChatGenerator | None = None
+_reranker: Reranker | None = None
 _decomposer: QueryDecomposer | None = None
 _rewriter: QueryRewriter | None = None
 _history_store: ChatHistoryStore | None = None
@@ -136,17 +136,15 @@ def _startup() -> None:
     """
     Открываем долгоживущие соединения при старте процесса.
 
-    Reranker — отдельный кусок: при первой инициализации он скачает
-    модель ~570 МБ с HuggingFace Hub. Дальше — мгновенный старт из кэша.
-    Чтобы не блокировать запуск, если модель ещё не скачана — инициализация
-    в try/except: если что-то пошло не так, сервер всё равно стартует,
-    просто rerank-параметр будет отдавать 503.
+    Reranker теперь сетевой (Voyage /rerank) — инициализация мгновенна;
+    try/except оставляем на случай недоступности сети или отсутствия ключа:
+    тогда rerank-параметр отдаёт 503.
     """
     global _embedder, _store, _generator, _reranker, _decomposer, _rewriter
     global _history_store, _router
-    _embedder = LMStudioEmbedder()
+    _embedder = make_embedder()
     _store = VectorStore()
-    _generator = LMStudioGenerator()
+    _generator = ChatGenerator()
     # Decomposer и Rewriter переиспользуют HTTP-клиент генератора (тот же
     # endpoint /chat/completions). Стартуют мгновенно.
     _decomposer = QueryDecomposer(_generator)
@@ -156,7 +154,7 @@ def _startup() -> None:
     # Router — тот же HTTP-клиент chat-модели, классифицирует запросы.
     _router = QueryRouter(_generator)
     try:
-        _reranker = CrossEncoderReranker()
+        _reranker = make_reranker()
     except Exception as exc:
         # Не критично для остального API — просто rerank будет недоступен.
         print(f"⚠ Reranker не инициализирован: {exc}")
@@ -276,7 +274,7 @@ class ExplainOut(BaseModel):
     """
     # ── про эмбеддинг запроса ─────────────────────────────────────────
     embed_model: str
-    embed_dim: int            # размерность вектора (для bge-m3 = 1024)
+    embed_dim: int            # размерность вектора (для voyage-4-large = 1024)
     embed_ms: float           # сколько мс заняла эмбеддинг-операция
     query_norm: float         # ||q|| — длина вектора запроса
     query_preview: list[float]  # первые ~32 значения для визуализации
@@ -414,7 +412,7 @@ def _multi_query_per_subq_rerank(
     best_by_key: dict[tuple[str, int], RetrievedChunk] = {}
 
     for subq in subqueries:
-        subq_vec = _embedder.embed_one(subq)
+        subq_vec = _embedder.embed_query(subq)
         cand = _store.hybrid_search(
             subq, subq_vec,
             top_k=candidate_per_subq,
@@ -428,7 +426,7 @@ def _multi_query_per_subq_rerank(
             key = (c.source, c.chunk_index)
             existing = best_by_key.get(key)
             # Keep the best score across subqueries. reranker_score
-            # сопоставим между подзапросами (sigmoid у нашего bge-reranker).
+            # сопоставим между подзапросами (нормированный score reranker'а).
             if existing is None or (
                 (c.reranker_score or 0.0) > (existing.reranker_score or 0.0)
             ):
@@ -467,7 +465,7 @@ def _multi_query_hybrid(
     rrf_scores: dict[tuple[str, int], float] = defaultdict(float)
 
     for subq in subqueries:
-        subq_vec = _embedder.embed_one(subq)
+        subq_vec = _embedder.embed_query(subq)
         hits = _store.hybrid_search(
             subq, subq_vec,
             top_k=candidate_per_subq,
@@ -595,7 +593,7 @@ def _retrieve_with_explain(
     #      базы к исходному вопросу, не к подзапросам);
     #    - single-query retrieval, если decompose выключен.
     t0 = time.perf_counter()
-    query_vec = _embedder.embed_one(query)
+    query_vec = _embedder.embed_query(query)
     embed_ms = (time.perf_counter() - t0) * 1000.0
 
     # 1.5. Декомпозиция запроса (опционально). Если выключено —
@@ -756,7 +754,7 @@ def _retrieve_with_explain(
         if _reranker is None:
             raise HTTPException(
                 status_code=503,
-                detail="Reranker не инициализирован (модель ещё не скачана?)",
+                detail="Reranker не инициализирован (нет сети или VOYAGE_API_KEY?)",
             )
         t_rr = time.perf_counter()
         # Если MMR включён — reranker оставляет pool_size кандидатов,
@@ -852,7 +850,7 @@ def _retrieve_with_explain(
     below = top_sim is not None and top_sim < min_similarity
 
     explain = ExplainOut(
-        embed_model=settings.embedding_model,
+        embed_model=settings.voyage_embedding_model,
         embed_dim=len(query_vec),
         embed_ms=round(embed_ms, 1),
         query_norm=q_norm,
@@ -1098,10 +1096,10 @@ def _save_chat_messages(
     )
 
 
-# Порог уверенности reranker'а (sigmoid 0..1): ниже него считаем, что
-# модель НЕ нашла релевантного контекста и в Auto-режиме переключаемся
-# на общую LLM. Эмпирически на bge-reranker-v2-m3: релевантные чанки
-# дают 0.5-0.95, нерелевантные — почти 0. Запас выбран небольшой.
+# Порог уверенности reranker'а (нормированный score 0..1): ниже него
+# считаем, что модель НЕ нашла релевантного контекста и в Auto-режиме
+# переключаемся на общую LLM. Эмпирически релевантные чанки дают
+# 0.5-0.95, нерелевантные — почти 0. Запас выбран небольшой.
 AUTO_FALLBACK_RERANK_THRESHOLD = 0.1
 
 
@@ -1150,7 +1148,7 @@ def _empty_explain(**overrides) -> ExplainOut:
     """
     assert _embedder is not None
     return ExplainOut(
-        embed_model=settings.embedding_model,
+        embed_model=settings.voyage_embedding_model,
         embed_dim=settings.embedding_dim,
         embed_ms=0.0,
         query_norm=0.0,
@@ -1241,9 +1239,9 @@ def ask(req: AskRequest) -> AskResponse:
     #                       это правильный показатель «нашли ли релевантное».
     #       - rerank OFF → max cosine по ВСЕЙ базе (all_scores); top из
     #                       chunks ненадёжен (могут быть text-only).
-    #     На bge-m3 для русского cosine релевантного чанка часто 0.35-0.5
+    #     Для русского cosine релевантного чанка часто 0.35-0.5
     #     даже когда тема ровно в базе — поэтому полагаться только на cosine
-    #     рискованно.
+    #     рискованно (порог подобран эмпирически; на Voyage стоит перепроверить).
     should_fallback = _should_auto_fallback(
         auto_route=req.auto_route,
         route_intent=route_info.get("route_intent"),
@@ -1753,7 +1751,7 @@ def _index_text(text: str, source: str, chat_id: str | None = None) -> int:
     records: list[ChunkInput] = []
     for start in range(0, len(chunks), BATCH):
         batch = chunks[start : start + BATCH]
-        vectors = _embedder.embed_many([c.text for c in batch])
+        vectors = _embedder.embed_documents([c.text for c in batch])
         for chunk, vec in zip(batch, vectors):
             records.append(ChunkInput(
                 source=source,
@@ -1917,7 +1915,7 @@ class EvalRequest(BaseModel):
 def run_evaluation(req: EvalRequest) -> dict:
     """
     Прогон голден-сета. По умолчанию без rerank (тогда быстро, ~3 сек),
-    с include_rerank=True долго (~30 сек) но видно как cross-encoder
+    с include_rerank=True долго (~30 сек) но видно как reranker (Voyage)
     помогает на сложных запросах.
     """
     items = load_golden_set()

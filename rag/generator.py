@@ -2,11 +2,11 @@
 generator.py — шаг «Generation» в RAG.
 
 Берёт найденные чанки + вопрос пользователя, формирует промпт и шлёт в
-chat-модель LM Studio. Поддерживает два режима:
+chat-модель OpenAI-совместимого провайдера (OpenRouter). Поддерживает два режима:
   - generate()        — обычный ответ строкой
   - generate_stream() — генератор, который выдаёт куски ответа по мере поступления
 
-API чата в LM Studio тоже OpenAI-совместимый:
+API чата OpenAI-совместимое:
 
     POST {base}/chat/completions
     {
@@ -84,9 +84,30 @@ def build_user_prompt(query: str, chunks: Iterable[RetrievedChunk]) -> str:
     )
 
 
-class LMStudioGenerator:
+def build_headers(
+    api_key: str, referer: str = "", title: str = ""
+) -> dict[str, str]:
     """
-    Клиент к /v1/chat/completions LM Studio.
+    Заголовки для OpenAI-совместимого chat-API.
+    referer/title — необязательная атрибуция OpenRouter (рейтинги приложений);
+    пустые значения не отправляем.
+    """
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    if referer:
+        headers["HTTP-Referer"] = referer
+    if title:
+        headers["X-Title"] = title
+    return headers
+
+
+class ChatGenerator:
+    """
+    Клиент к /chat/completions OpenAI-совместимого провайдера (OpenRouter
+    по умолчанию; подойдёт любой OpenAI-compat endpoint — достаточно сменить
+    LLM_BASE_URL/LLM_API_KEY/LLM_MODEL в .env).
     """
 
     def __init__(
@@ -96,18 +117,17 @@ class LMStudioGenerator:
         model: str | None = None,
         timeout: float = 120.0,
     ) -> None:
-        self._base_url = (base_url or settings.lm_studio_base_url).rstrip("/")
-        self._api_key = api_key or settings.lm_studio_api_key
-        self._model = model or settings.chat_model
+        self._base_url = (base_url or settings.llm_base_url).rstrip("/")
+        self._api_key = api_key or settings.llm_api_key
+        self._model = model or settings.llm_model
         self._timeout = timeout
-        # Для streaming делаем отдельный клиент с большим таймаутом —
-        # streaming-ответ может «капать» минутами.
         self._client = httpx.Client(
             timeout=timeout,
-            headers={
-                "Authorization": f"Bearer {self._api_key}",
-                "Content-Type": "application/json",
-            },
+            headers=build_headers(
+                self._api_key,
+                settings.llm_http_referer,
+                settings.llm_app_title,
+            ),
         )
 
     # --- обычный (нестриминговый) ответ ---
@@ -207,7 +227,7 @@ class LMStudioGenerator:
     def close(self) -> None:
         self._client.close()
 
-    def __enter__(self) -> "LMStudioGenerator":
+    def __enter__(self) -> "ChatGenerator":
         return self
 
     def __exit__(self, *_exc_info: object) -> None:

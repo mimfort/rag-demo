@@ -48,12 +48,20 @@ class Settings:
     frozen защищает от случайной перезаписи поля в рантайме.
     """
 
-    # --- LM Studio ---
-    lm_studio_base_url: str
-    lm_studio_api_key: str
-    embedding_model: str
+    # --- LLM (chat) — OpenAI-совместимый провайдер (OpenRouter по умолчанию) ---
+    llm_base_url: str
+    llm_api_key: str
+    llm_model: str
+    # Опциональные заголовки атрибуции OpenRouter (пустая строка = не слать).
+    llm_http_referer: str
+    llm_app_title: str
+
+    # --- Voyage AI (embeddings + rerank) ---
+    voyage_api_key: str
+    voyage_base_url: str
+    voyage_embedding_model: str
+    voyage_rerank_model: str
     embedding_dim: int
-    chat_model: str
 
     # --- PostgreSQL ---
     db_host: str
@@ -88,11 +96,16 @@ def load_settings() -> Settings:
     Вызывается один раз при импорте модуля — см. ниже.
     """
     return Settings(
-        lm_studio_base_url=_env("LM_STUDIO_BASE_URL"),
-        lm_studio_api_key=_env("LM_STUDIO_API_KEY"),
-        embedding_model=_env("EMBEDDING_MODEL", "text-embedding-bge-m3"),
+        llm_base_url=_env("LLM_BASE_URL", "https://openrouter.ai/api/v1"),
+        llm_api_key=_env("LLM_API_KEY"),
+        llm_model=_env("LLM_MODEL"),
+        llm_http_referer=os.getenv("LLM_HTTP_REFERER", ""),
+        llm_app_title=os.getenv("LLM_APP_TITLE", ""),
+        voyage_api_key=_env("VOYAGE_API_KEY"),
+        voyage_base_url=_env("VOYAGE_BASE_URL", "https://api.voyageai.com/v1"),
+        voyage_embedding_model=_env("VOYAGE_EMBEDDING_MODEL", "voyage-4-large"),
+        voyage_rerank_model=_env("VOYAGE_RERANK_MODEL", "rerank-2.5"),
         embedding_dim=_env_int("EMBEDDING_DIM", 1024),
-        chat_model=_env("CHAT_MODEL", "google/gemma-3-4b-it"),
         db_host=_env("DB_HOST", "localhost"),
         db_port=_env_int("DB_PORT", 5432),
         db_name=_env("DB_NAME", "rag"),

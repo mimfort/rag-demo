@@ -1,7 +1,7 @@
 """
 decomposer.py — query decomposition через LLM.
 
-Зачем: bi-encoder (наш bge-m3) превращает любой текст в **один** вектор
+Зачем: bi-encoder (наш эмбеддер) превращает любой текст в **один** вектор
 фиксированной длины. Если в запросе несколько разных вопросов, их смыслы
 смешиваются — вектор оказывается «посередине» в семантическом пространстве,
 и каждый из аспектов получает посредственный score.
@@ -31,7 +31,7 @@ import json
 import re
 from dataclasses import dataclass
 
-from rag.generator import LMStudioGenerator
+from rag.generator import ChatGenerator
 
 
 @dataclass(frozen=True)
@@ -93,7 +93,7 @@ class QueryDecomposer:
     лишних HTTP-клиентов.
     """
 
-    def __init__(self, generator: LMStudioGenerator) -> None:
+    def __init__(self, generator: ChatGenerator) -> None:
         self._generator = generator
 
     def decompose(self, query: str) -> DecomposeResult:

@@ -24,7 +24,7 @@ from pathlib import Path
 
 from rag.chunker import chunk_text
 from rag.config import settings
-from rag.embedder import LMStudioEmbedder
+from rag.embedder import Embedder, make_embedder
 from rag.vector_store import ChunkInput, VectorStore
 
 
@@ -51,7 +51,7 @@ def batched(items: list, size: int):
 
 def ingest_file(
     path: Path,
-    embedder: LMStudioEmbedder,
+    embedder: Embedder,
     store: VectorStore,
     batch_size: int,
 ) -> int:
@@ -81,11 +81,11 @@ def ingest_file(
 
     total = 0
     # Эмбеддим пачками: меньше HTTP-вызовов = быстрее.
-    # ВНИМАНИЕ: bge-m3 при больших батчах ест много VRAM.
-    # Если LM Studio будет ругаться — уменьшите --batch-size.
+    # ВНИМАНИЕ: Voyage принимает до 1000 текстов за запрос.
+    # При ошибках лимита уменьшите --batch-size.
     for batch in batched(chunks, batch_size):
         texts = [c.text for c in batch]
-        vectors = embedder.embed_many(texts)
+        vectors = embedder.embed_documents(texts)
         records = [
             ChunkInput(
                 source=source,
@@ -114,7 +114,7 @@ def main() -> int:
         "--batch-size",
         type=int,
         default=16,
-        help="Сколько чанков отправлять в LM Studio за один запрос. По умолчанию: 16",
+        help="Сколько чанков отправлять в Voyage за один запрос. По умолчанию: 16",
     )
     args = parser.parse_args()
 
@@ -131,7 +131,7 @@ def main() -> int:
 
     # Открываем embedder и store через context manager, чтобы гарантированно
     # закрыть HTTP-клиент и соединение с БД даже при ошибке.
-    with LMStudioEmbedder() as embedder, VectorStore() as store:
+    with make_embedder() as embedder, VectorStore() as store:
         total = 0
         for path in files:
             print(f"\n→ {path.name}")

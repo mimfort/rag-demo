@@ -10,7 +10,7 @@ rewriter.py — query rewriting через LLM.
                  (одна и та же тема, РАЗНЫЕ формулировки)
 
 Зачем нужен rewriter:
-  bi-encoder (наш bge-m3) кодирует текст в один вектор. Разные слова про
+  bi-encoder (наш эмбеддер) кодирует текст в один вектор. Разные слова про
   одно и то же могут давать ЗАМЕТНО разные векторы — например модель видит
   «асинхронность» и «параллельность» близкими, а «GIL» и «многопоточность»
   далёкими (хотя для человека понятно что связаны).
@@ -31,7 +31,7 @@ import json
 import re
 from dataclasses import dataclass
 
-from rag.generator import LMStudioGenerator
+from rag.generator import ChatGenerator
 
 
 @dataclass(frozen=True)
@@ -82,10 +82,10 @@ _JSON_ARRAY_RE = re.compile(r"\[[\s\S]*\]")
 
 class QueryRewriter:
     """
-    Через тот же LMStudioGenerator (chat-модель) генерирует N переформулировок.
+    Через тот же ChatGenerator (chat-модель) генерирует N переформулировок.
     """
 
-    def __init__(self, generator: LMStudioGenerator) -> None:
+    def __init__(self, generator: ChatGenerator) -> None:
         self._generator = generator
 
     def rewrite(self, query: str, n: int = 3) -> RewriteResult:
