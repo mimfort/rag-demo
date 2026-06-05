@@ -48,7 +48,7 @@ from rag.loaders import (
 from rag.vector_store import ChunkInput
 
 from rag.config import settings
-from rag.embedder import LMStudioEmbedder
+from rag.embedder import Embedder, make_embedder
 from rag.generator import ChatGenerator, build_user_prompt
 from rag.decomposer import QueryDecomposer
 from rag.history import ChatHistoryStore, Message, make_standalone_query
@@ -121,7 +121,7 @@ app.add_middleware(
 )
 
 # Эти объекты заполнятся в startup-хендлере ниже.
-_embedder: LMStudioEmbedder | None = None
+_embedder: Embedder | None = None
 _store: VectorStore | None = None
 _generator: ChatGenerator | None = None
 _reranker: CrossEncoderReranker | None = None
@@ -144,7 +144,7 @@ def _startup() -> None:
     """
     global _embedder, _store, _generator, _reranker, _decomposer, _rewriter
     global _history_store, _router
-    _embedder = LMStudioEmbedder()
+    _embedder = make_embedder()
     _store = VectorStore()
     _generator = ChatGenerator()
     # Decomposer и Rewriter переиспользуют HTTP-клиент генератора (тот же
@@ -414,7 +414,7 @@ def _multi_query_per_subq_rerank(
     best_by_key: dict[tuple[str, int], RetrievedChunk] = {}
 
     for subq in subqueries:
-        subq_vec = _embedder.embed_one(subq)
+        subq_vec = _embedder.embed_query(subq)
         cand = _store.hybrid_search(
             subq, subq_vec,
             top_k=candidate_per_subq,
@@ -467,7 +467,7 @@ def _multi_query_hybrid(
     rrf_scores: dict[tuple[str, int], float] = defaultdict(float)
 
     for subq in subqueries:
-        subq_vec = _embedder.embed_one(subq)
+        subq_vec = _embedder.embed_query(subq)
         hits = _store.hybrid_search(
             subq, subq_vec,
             top_k=candidate_per_subq,
@@ -595,7 +595,7 @@ def _retrieve_with_explain(
     #      базы к исходному вопросу, не к подзапросам);
     #    - single-query retrieval, если decompose выключен.
     t0 = time.perf_counter()
-    query_vec = _embedder.embed_one(query)
+    query_vec = _embedder.embed_query(query)
     embed_ms = (time.perf_counter() - t0) * 1000.0
 
     # 1.5. Декомпозиция запроса (опционально). Если выключено —
@@ -1753,7 +1753,7 @@ def _index_text(text: str, source: str, chat_id: str | None = None) -> int:
     records: list[ChunkInput] = []
     for start in range(0, len(chunks), BATCH):
         batch = chunks[start : start + BATCH]
-        vectors = _embedder.embed_many([c.text for c in batch])
+        vectors = _embedder.embed_documents([c.text for c in batch])
         for chunk, vec in zip(batch, vectors):
             records.append(ChunkInput(
                 source=source,

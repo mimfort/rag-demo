@@ -23,7 +23,7 @@ import argparse
 import sys
 
 from rag.config import settings
-from rag.embedder import LMStudioEmbedder
+from rag.embedder import make_embedder
 from rag.generator import ChatGenerator, build_user_prompt
 from rag.retriever import Retriever
 from rag.vector_store import RetrievedChunk, VectorStore
@@ -48,7 +48,7 @@ def print_retrieved_chunks(chunks: list[RetrievedChunk]) -> None:
 def run(query: str, top_k: int, stream: bool, verbose: bool) -> int:
     # Открываем все три ресурса разом: эмбеддер, хранилище, генератор.
     with (
-        LMStudioEmbedder() as embedder,
+        make_embedder() as embedder,
         VectorStore() as store,
         ChatGenerator() as generator,
     ):
