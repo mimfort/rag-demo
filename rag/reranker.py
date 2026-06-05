@@ -36,6 +36,8 @@ class Reranker(Protocol):
         self, query: str, chunks: list[RetrievedChunk], top_k: int | None = None
     ) -> list[RetrievedChunk]: ...
 
+    def close(self) -> None: ...
+
 
 class VoyageReranker:
     """

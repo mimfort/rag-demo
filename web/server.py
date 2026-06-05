@@ -754,7 +754,7 @@ def _retrieve_with_explain(
         if _reranker is None:
             raise HTTPException(
                 status_code=503,
-                detail="Reranker не инициализирован (модель ещё не скачана?)",
+                detail="Reranker не инициализирован (нет сети или VOYAGE_API_KEY?)",
             )
         t_rr = time.perf_counter()
         # Если MMR включён — reranker оставляет pool_size кандидатов,
@@ -1239,9 +1239,9 @@ def ask(req: AskRequest) -> AskResponse:
     #                       это правильный показатель «нашли ли релевантное».
     #       - rerank OFF → max cosine по ВСЕЙ базе (all_scores); top из
     #                       chunks ненадёжен (могут быть text-only).
-    #     На bge-m3 для русского cosine релевантного чанка часто 0.35-0.5
+    #     Для русского cosine релевантного чанка часто 0.35-0.5
     #     даже когда тема ровно в базе — поэтому полагаться только на cosine
-    #     рискованно.
+    #     рискованно (порог подобран эмпирически; на Voyage стоит перепроверить).
     should_fallback = _should_auto_fallback(
         auto_route=req.auto_route,
         route_intent=route_info.get("route_intent"),
@@ -1915,7 +1915,7 @@ class EvalRequest(BaseModel):
 def run_evaluation(req: EvalRequest) -> dict:
     """
     Прогон голден-сета. По умолчанию без rerank (тогда быстро, ~3 сек),
-    с include_rerank=True долго (~30 сек) но видно как cross-encoder
+    с include_rerank=True долго (~30 сек) но видно как reranker (Voyage)
     помогает на сложных запросах.
     """
     items = load_golden_set()

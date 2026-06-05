@@ -81,8 +81,8 @@ def ingest_file(
 
     total = 0
     # Эмбеддим пачками: меньше HTTP-вызовов = быстрее.
-    # ВНИМАНИЕ: bge-m3 при больших батчах ест много VRAM.
-    # Если LM Studio будет ругаться — уменьшите --batch-size.
+    # ВНИМАНИЕ: Voyage принимает до 1000 текстов за запрос.
+    # При ошибках лимита уменьшите --batch-size.
     for batch in batched(chunks, batch_size):
         texts = [c.text for c in batch]
         vectors = embedder.embed_documents(texts)
@@ -114,7 +114,7 @@ def main() -> int:
         "--batch-size",
         type=int,
         default=16,
-        help="Сколько чанков отправлять в LM Studio за один запрос. По умолчанию: 16",
+        help="Сколько чанков отправлять в Voyage за один запрос. По умолчанию: 16",
     )
     args = parser.parse_args()
 

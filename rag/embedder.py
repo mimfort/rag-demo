@@ -36,6 +36,8 @@ class Embedder(Protocol):
 
     def embed_documents(self, texts: Iterable[str]) -> list[list[float]]: ...
 
+    def close(self) -> None: ...
+
 
 class VoyageEmbedder:
     """
