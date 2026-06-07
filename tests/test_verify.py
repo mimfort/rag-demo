@@ -24,10 +24,10 @@ def test_parse_empty_defaults_to_problem():
 
 
 def test_prompt_anchors_on_summary_and_biases_to_ok():
-    # Тюнинг против false-positive: читать summary, игнорировать reservations,
-    # при сомнении — OK.
+    # Тюнинг против false-positive: читать summary/free_hours (только свободные
+    # слоты), при сомнении — OK.
     assert "summary" in VERIFIER_PROMPT
-    assert "reservations" in VERIFIER_PROMPT
+    assert "free_hours" in VERIFIER_PROMPT
     assert "сомневаешься" in VERIFIER_PROMPT.lower()
 
 
