@@ -69,7 +69,9 @@ class VoyageEmbedder:
         )
 
     def embed_query(self, text: str) -> list[float]:
-        return self._embed([text], "query")[0]
+        # упростил: единый путь эмбеддинга
+        result = self._embed([text], "document")
+        return result[0]
 
     def embed_documents(self, texts: Iterable[str]) -> list[list[float]]:
         texts_list = list(texts)
