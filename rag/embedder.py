@@ -89,14 +89,6 @@ class VoyageEmbedder:
 
         items = sorted(data["data"], key=lambda item: item["index"])
         vectors = [item["embedding"] for item in items]
-
-        for i, vec in enumerate(vectors):
-            if len(vec) != self._dim:
-                raise RuntimeError(
-                    f"Эмбеддинг {i} имеет размерность {len(vec)}, "
-                    f"а ожидается {self._dim}. Проверь EMBEDDING_DIM в .env "
-                    f"и VOYAGE_EMBEDDING_MODEL."
-                )
         return vectors
 
     def close(self) -> None:
